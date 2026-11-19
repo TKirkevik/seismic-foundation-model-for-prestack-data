@@ -301,16 +301,27 @@ function paintSectionCanvas(
   return true
 }
 
+// three.js fixes a texture's GPU storage size at its first upload; if the canvas is
+// resized afterwards (e.g. the first frame uploaded the blank 300x150 default before the
+// section fetch finished), later uploads fail silently and the plane stays black.
+// Disposing frees the old storage so the next render reallocates it at the new size.
+function repaintSlice(
+  canvas: HTMLCanvasElement,
+  tex: THREE.CanvasTexture | null,
+  sec: SectionResponseData | null,
+  axis: SectionAxis,
+) {
+  const prevW = canvas.width
+  const prevH = canvas.height
+  if (!paintSectionCanvas(canvas, sec, axis) || !tex) return
+  if (canvas.width !== prevW || canvas.height !== prevH) tex.dispose()
+  tex.needsUpdate = true
+}
+
 function updateSliceTextures() {
-  if (paintSectionCanvas(inlineCanvas, store.sections.inline, 'inline') && inlineTex) {
-    inlineTex.needsUpdate = true
-  }
-  if (paintSectionCanvas(xlineCanvas, store.sections.xline, 'xline') && xlineTex) {
-    xlineTex.needsUpdate = true
-  }
-  if (paintSectionCanvas(sampleCanvas, store.sections.sample, 'sample') && sampleTex) {
-    sampleTex.needsUpdate = true
-  }
+  repaintSlice(inlineCanvas, inlineTex, store.sections.inline, 'inline')
+  repaintSlice(xlineCanvas, xlineTex, store.sections.xline, 'xline')
+  repaintSlice(sampleCanvas, sampleTex, store.sections.sample, 'sample')
 }
 
 function updateSlicePositions() {
