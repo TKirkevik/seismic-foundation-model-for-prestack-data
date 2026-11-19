@@ -87,15 +87,17 @@ Useful flags: `--offsets 0:100:5`, `--num-overlap-patches 0` (≈2× faster), `-
 ```
 
 For every patch, the 100 embeddings `e_h` (one per offset `h`) trace a trajectory in the 768-d
-latent space. The script describes it with a point and an orthonormal 2-D basis. With `--rms`,
-an offset is **live** for a patch when its RMS is ≥ `--live-threshold` (0.2) × the patch's
-maximum RMS over offsets; the fit, PCA and variance statistics use live offsets only, so muted
-far offsets / dead traces do not define the directions. Without `--rms` all offsets are used —
-on this dataset that makes axis 1 largely "the direction from data to no-data".
+latent space. The script describes it with a point and an orthonormal 2-D basis. Offsets with
+`|h| < --min-offset` (300 m, the near-offset taper) are never used in the fit. With `--rms`,
+an offset is additionally **live** for a patch only when its RMS is ≥ `--live-threshold` (0.2) ×
+the patch's maximum RMS over offsets; the fit, PCA and variance statistics use live offsets
+only, so muted far offsets / dead traces do not define the directions. Without `--rms` every
+offset ≥ 300 m is used — on this dataset that makes axis 1 largely "the direction from data to
+no-data".
 
 | Key | Shape | Meaning |
 |---|---|---|
-| `zero_offset` | `(…, 768)` | mean of the −50 m and +50 m embeddings (no exact zero offset exists; note these bins are tapered) |
+| `zero_offset` | `(…, 768)` | **intercept** of the per-patch fit below, i.e. the trajectory extrapolated to `|h| = 0` from the live, un-tapered offsets (`--zero-offset nearest` gives the mean of the −50/+50 m embeddings instead — note these bins are tapered) |
 | `offset_direction` | `(…, 768)` | **axis 1**: unit slope `b/‖b‖` of the least-squares fit `e ≈ a + b·|h|` over the live offsets. Regressing on `|h|` makes the sign unambiguous: it points the way the embedding moves as offset grows. |
 | `offset_curvature` | `(…, 768)` | **axis 2**: top principal component of the across-offset variation after projecting axis 1 out; orthogonal to axis 1, oriented so its coordinate correlates positively with centred `|h|²` (points the way the trajectory bows at far offsets). |
 | `offset_coords` | `(n_off, …, 2)` | coordinates of `e_h − zero_offset` in the basis (all offsets): `e_h ≈ zero_offset + c₁·direction + c₂·curvature` |
@@ -104,30 +106,34 @@ on this dataset that makes axis 1 largely "the direction from data to no-data".
 | `offset_axis_var` | `(…, 2)` | fraction of across-offset variance along each axis; the sum is the fraction captured by the plane |
 | `live_offsets`, `n_live_offsets` | `(n_off, …)`, `(…)` | live-offset mask and count; patches with < `--min-live` (4) live offsets are left as zeros |
 
-Flags: `--exclude-zero-offset` (leave ±50 m out of the fit), `--live-threshold`, `--min-live`,
+Flags: `--min-offset`, `--zero-offset intercept|nearest`, `--live-threshold`, `--min-live`,
 `--store-dtype float16`, `--chunk`.
 
 ### Findings on the current dataset
 
-Mute-aware fit (`--rms`, threshold 0.2; median 41 live offsets per patch, 3 % of patches unfittable):
+Mute-aware fit (`--rms`, threshold 0.2, offsets ≥ 300 m; median 36 live offsets per patch, 4 % of
+patches unfittable):
 
 | | q10 | median | q90 |
 |---|---|---|---|
-| linear-in-`|h|` fit R² | 0.18 | 0.28 | 0.45 |
-| variance along axis 1 | 0.21 | 0.33 | 0.52 |
-| variance along axis 2 | 0.14 | 0.21 | 0.32 |
-| variance in the 2-D plane | 0.43 | **0.57** | 0.73 |
+| linear-in-`|h|` fit R² | 0.20 | 0.32 | 0.49 |
+| variance along axis 1 | 0.24 | 0.37 | 0.55 |
+| variance along axis 2 | 0.13 | 0.20 | 0.31 |
+| variance in the 2-D plane | 0.45 | **0.59** | 0.74 |
 
-For comparison, fitting over *all* offsets gives median plane variance 0.72 (axis 1 0.54) — the
-difference is the trivial variance between live data and muted zeros, which the mute-aware fit
-removes.
+For comparison, fitting over *all* offsets with the ±50 m mean as origin gives median plane
+variance 0.72 (axis 1 0.54) — the difference is the trivial variance between live data and muted
+zeros, which the mute-aware fit removes.
 
-- The mean trajectory (see `figures/clusters_trajectories.png`) is the same for almost all
-  classes: a sharp excursion over the tapered ±50 → ±350 m bins, then a long, nearly straight
-  run along axis 1 with a bowl on axis 2 (≈ −6 at mid offsets), turning back near the mute.
-  Spherical k-means on `offset_direction` therefore separates *directions* in latent space
-  (centroid cosines ≤ 0.56) that share a common *shape*; the classes form layer-conformable
-  bands in section and coherent patches in map view.
+- With the intercept as origin the trajectories start at the origin and run out along axis 1
+  with a bowl on axis 2 (≈ −2 at ~2000 m), bending back as the mute is approached (see
+  `figures/clusters_trajectories.png`). The mean shape is shared by most k-means classes:
+  spherical k-means on `offset_direction` separates *directions* in latent space (centroid
+  cosines ≤ 0.5) that share a common *shape*; the classes form layer-conformable bands in
+  section and coherent patches in map view.
+- The tapered ±50 m embedding sits ~0.7 × the axis-1 span away from the intercept, mostly
+  *along* axis 1 (median cosine 0.69) — the model reads the low-amplitude near bins much like
+  low-amplitude far bins, i.e. axis 1 carries a strong amplitude component.
 - Fitting positive and negative offsets separately (all-offset fit) gives directions with median
   cosine 0.94 (q10 0.60), so regressing on `|h|` is a reasonable default.
 
@@ -147,8 +153,8 @@ faint/grey in the trajectory plots.
 
 ## Possible next steps
 
-- Replace the tapered ±50 m `zero_offset` by the intercept of the fit over un-tapered live
-  offsets, and/or start the regression at ≈ 300 m.
+- Tighten `--live-threshold` (0.3–0.5) to keep the mute ramp itself out of the fit; a few
+  classes still show large axis-1 excursions right at the mute edge.
 - Separate positive/negative offset bases for the asymmetric patches.
 - Per-offset normalisation (instead of a global std) to isolate waveform/shape changes from
   amplitude-vs-offset.
