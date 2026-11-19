@@ -22,11 +22,9 @@ const MODE_LABELS: Record<string, string> = {
 const ATTR_LABELS: Record<string, string> = {
   offset_slope: 'Offset Slope ‖b‖',
   offset_fit_r2: 'Linear Fit R²',
-  offset_axis1_var: 'Axis 1 Variance',
-  offset_axis2_var: 'Axis 2 Curvature Variance',
-  offset_plane_var: '2D Plane Total Variance',
-  offset_axis_var_0: 'Axis 1 Variance',
-  offset_axis_var_1: 'Axis 2 Curvature Variance',
+  offset_axis_var_1: 'Axis 1 Variance',
+  offset_axis_var_2: 'Axis 2 Curvature Variance',
+  offset_axis_var_plane: '2D Plane Total Variance',
 }
 
 function formatModeLabel(mode: string): string {

@@ -175,7 +175,7 @@ def generate_demo_embeddings(
             if reader.is_4d:
                 vol = reader.read_offset(off_idx)
             else:
-                vol = reader.read_volume(0, n_il, 0, n_xl, 0, n_t)
+                vol = reader.read_volume()
 
             if i % max(1, len(offset_indices) // 4) == 0:
                 live = vol[np.any(vol != 0, axis=-1)].astype(np.float64)

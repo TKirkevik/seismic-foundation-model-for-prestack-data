@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
+import zipfile
+from pathlib import Path
 
 import numpy as np
+from numpy.lib import format as npformat
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import Settings
+from app.latent_store import LatentStore
 from app.main import app
 
 SURVEY_ID = "ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time"
@@ -224,3 +230,161 @@ def test_jobs_and_preprocess_stub(client: TestClient):
     )
     assert prep.status_code == 200
     assert prep.json()["status"] == "unsupported"
+
+
+def _write_test_patch_npz(path: Path, offsets: list[float] | None = None) -> None:
+    offs = np.asarray(offsets if offsets is not None else [0.0, 100.0], dtype=np.float64)
+    emb = np.arange(len(offs) * 2 * 2 * 2 * 4, dtype=np.float16).reshape(len(offs), 2, 2, 2, 4)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        with zf.open("embeddings.npy", "w") as fh:
+            npformat.write_array(fh, emb, allow_pickle=False)
+        for name, val in {
+            "offsets": offs,
+            "il_patch_start": np.array([0, 16], dtype=np.int64),
+            "xl_patch_start": np.array([0, 16], dtype=np.int64),
+            "t_patch_start": np.array([0, 16], dtype=np.int64),
+            "patch_size": np.array(16, dtype=np.int64),
+        }.items():
+            with zf.open(f"{name}.npy", "w") as fh:
+                npformat.write_array(fh, val, allow_pickle=False)
+
+
+def test_release_set_removes_until_rescan_and_concurrent_safety(tmp_path: Path):
+    npz_path = tmp_path / "foo_demo_patch_embeddings.npz"
+    _write_test_patch_npz(npz_path)
+
+    store = LatentStore(tmp_path)
+    store.scan(["foo"])
+
+    handle = store.get_set("foo", "demo")
+    vol_before = handle.read_offset_volume(0)
+    assert vol_before.shape == (2, 2, 2, 4)
+    assert vol_before.dtype == np.float32
+    assert not isinstance(vol_before, np.memmap)
+
+    errors: list[Exception] = []
+    stop_reading = threading.Event()
+
+    def _reader() -> None:
+        while not stop_reading.is_set():
+            try:
+                arr = handle.read_offset_volume(0)
+                assert np.isfinite(arr).all()
+            except RuntimeError as exc:
+                if "closed" not in str(exc):
+                    errors.append(exc)
+                break
+            except Exception as exc:
+                errors.append(exc)
+                break
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    store.release_set("foo", "demo")
+    stop_reading.set()
+    t.join(timeout=2)
+    assert not errors
+
+    # Snapshot read before close remains valid; handle rejects new reads; store hides set until rescan.
+    assert np.isfinite(vol_before).all()
+    with pytest.raises(KeyError):
+        store.get_set("foo", "demo")
+    with pytest.raises(RuntimeError, match="closed"):
+        handle.read_offset_volume(0)
+    with pytest.raises(RuntimeError, match="closed"):
+        handle.read_zero_offset_volume(np.array([0]))
+
+    store.scan(["foo"])
+    reloaded = store.get_set("foo", "demo")
+    assert reloaded is not handle
+    assert reloaded.read_offset_volume(0).shape == (2, 2, 2, 4)
+    store.close()
+
+
+def test_longest_prefix_npz_pairing(tmp_path: Path):
+    _write_test_patch_npz(tmp_path / "foo_demo_patch_embeddings.npz")
+    _write_test_patch_npz(tmp_path / "foo_sub_demo_patch_embeddings.npz")
+    _write_test_patch_npz(tmp_path / "foo_sub_patch_embeddings.npz")
+
+    store = LatentStore(tmp_path)
+    store.scan(["foo", "foo_sub"])
+
+    foo_ids = {h.id for h in store.list_for_survey("foo")}
+    foo_sub_ids = {h.id for h in store.list_for_survey("foo_sub")}
+    assert foo_ids == {"demo"}
+    assert foo_sub_ids == {"demo", "default"}
+    store.close()
+
+
+def test_duplicate_active_job_returns_409(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    import app.jobs as jobs_mod
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_demo(*args, **kwargs):
+        started.set()
+        release.wait(timeout=5)
+        raise RuntimeError("aborted test stub")
+
+    monkeypatch.setattr(jobs_mod, "generate_demo_embeddings", _blocking_demo)
+
+    resp1 = client.post(
+        "/api/jobs/demo-embeddings",
+        json={"survey_id": SURVEY_ID, "tag": "conflict_tag", "offset_stride": 5},
+    )
+    assert resp1.status_code == 200
+    job_id = resp1.json()["id"]
+    assert started.wait(timeout=2)
+
+    resp2 = client.post(
+        "/api/jobs/demo-embeddings",
+        json={"survey_id": SURVEY_ID, "tag": "conflict_tag", "offset_stride": 5},
+    )
+    assert resp2.status_code == 409
+
+    cancel_resp = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_resp.status_code == 200
+    assert cancel_resp.json()["status"] == "cancelled"
+    release.set()
+
+
+def test_config_resolves_relative_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    cfg = Settings(
+        repo_root=Path("."),
+        data_dir=Path("rel_data"),
+        embeddings_dir=Path("rel_emb"),
+        weights_dir=Path("rel_weights"),
+        embedders_dir=Path("rel_embedders"),
+    )
+    assert cfg.repo_root == tmp_path.resolve()
+    assert cfg.data_dir == (tmp_path / "rel_data").resolve()
+    assert cfg.embeddings_dir == (tmp_path / "rel_emb").resolve()
+    assert cfg.weights_dir == (tmp_path / "rel_weights").resolve()
+    assert cfg.embedders_dir == (tmp_path / "rel_embedders").resolve()
+
+
+def test_rescan_reuses_unchanged_survey_handles(client: TestClient):
+    backend = app.state.backend
+    before = backend.seismic_store.get_survey(SURVEY_ID)
+    rescan_resp = client.post("/api/surveys/rescan")
+    assert rescan_resp.status_code == 200
+    after = backend.seismic_store.get_survey(SURVEY_ID)
+    assert after is before
+    assert after._closed is False
+
+
+def test_has_distinct_abs_offsets_and_cube_stats_progress(tmp_path: Path):
+    from app.jobs import _has_distinct_abs_offsets
+
+    single_off = tmp_path / "single.npz"
+    sym_off = tmp_path / "sym.npz"
+    multi_off = tmp_path / "multi.npz"
+    _write_test_patch_npz(single_off, offsets=[50.0])
+    _write_test_patch_npz(sym_off, offsets=[-100.0, 100.0])
+    _write_test_patch_npz(multi_off, offsets=[0.0, 100.0])
+
+    assert _has_distinct_abs_offsets(single_off) is False
+    assert _has_distinct_abs_offsets(sym_off) is False
+    assert _has_distinct_abs_offsets(multi_off) is True

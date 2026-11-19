@@ -9,12 +9,14 @@ import subprocess
 import sys
 import threading
 import uuid
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 from scripts.generate_demo_embeddings import generate_demo_embeddings
 
 from .config import Settings
@@ -28,8 +30,31 @@ log = logging.getLogger(__name__)
 _PCT_RE = re.compile(r"(\d{1,3})%")
 
 
+class JobConflictError(RuntimeError):
+    """Raised when a conflicting active job is already queued or running."""
+
+
+class _JobCancelled(Exception):
+    """Internal sentinel raised when an in-process job observes cancellation."""
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_tag(tag: str | None) -> str | None:
+    if tag is None:
+        return None
+    return "default" if not tag or tag == "default" else tag
+
+
+def _has_distinct_abs_offsets(patch_npz: Path) -> bool:
+    with zipfile.ZipFile(patch_npz, "r") as zf:
+        if "offsets.npy" not in zf.namelist():
+            return False
+        with zf.open("offsets.npy", "r") as fh:
+            offsets = np.asarray(np.load(fh, allow_pickle=False), dtype=np.float64).reshape(-1)
+    return int(np.unique(np.abs(offsets)).size) >= 2
 
 
 @dataclass
@@ -37,6 +62,7 @@ class _JobRecord:
     id: str
     job_type: str
     survey_id: str
+    tag: str | None = None
     status: str = "queued"
     progress_pct: float = 0.0
     message: str = ""
@@ -111,17 +137,46 @@ class JobManager:
                 raise KeyError(f"Unknown job '{job_id}'")
             return self._jobs[job_id].to_model()
 
-    def _register_job(self, job_type: str, survey_id: str, message: str) -> _JobRecord:
-        rec = _JobRecord(
-            id=uuid.uuid4().hex[:12],
-            job_type=job_type,
-            survey_id=survey_id,
-            status="queued",
-            message=message,
-        )
+    def _register_job(
+        self, job_type: str, survey_id: str, message: str, tag: str | None = None
+    ) -> _JobRecord:
+        norm_tag = _normalize_tag(tag)
         with self._lock:
+            for existing in self._jobs.values():
+                if existing.status not in ("queued", "running"):
+                    continue
+                if job_type == "embed" and existing.job_type == "embed":
+                    raise JobConflictError(
+                        f"Active embed job '{existing.id}' is already running on GPU/MPS"
+                    )
+                if (
+                    norm_tag is not None
+                    and existing.survey_id == survey_id
+                    and existing.tag == norm_tag
+                ):
+                    raise JobConflictError(
+                        f"Active job '{existing.id}' ({existing.job_type}) already targets "
+                        f"survey '{survey_id}' tag '{norm_tag}'"
+                    )
+                if (
+                    job_type == "preprocess"
+                    and existing.job_type == "preprocess"
+                    and existing.survey_id == survey_id
+                ):
+                    raise JobConflictError(
+                        f"Active preprocess job '{existing.id}' already targets survey '{survey_id}'"
+                    )
+
+            rec = _JobRecord(
+                id=uuid.uuid4().hex[:12],
+                job_type=job_type,
+                survey_id=survey_id,
+                tag=norm_tag,
+                status="queued",
+                message=message,
+            )
             self._jobs[rec.id] = rec
-        return rec
+            return rec
 
     def _run_subprocess(
         self,
@@ -134,6 +189,10 @@ class JobManager:
         env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
 
+        with self._lock:
+            if rec.cancel_requested:
+                return -1
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -142,10 +201,23 @@ class JobManager:
             encoding="utf-8",
             errors="replace",
             env=env,
-            cwd=str(self.settings.embedders_dir.parent),
+            cwd=str(self.settings.repo_root),
         )
+        cancelled_during_spawn = False
         with self._lock:
-            rec.process = proc
+            if rec.cancel_requested:
+                cancelled_during_spawn = True
+            else:
+                rec.process = proc
+
+        if cancelled_during_spawn:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            return -1
 
         assert proc.stdout is not None
         buf: list[str] = []
@@ -159,10 +231,11 @@ class JobManager:
                 if line:
                     with self._lock:
                         rec.logs_tail.append(line)
-                        m = _PCT_RE.search(line)
-                        if m:
-                            pct = min(100, max(0, int(m.group(1))))
-                            rec.progress_pct = pct_start + (pct_end - pct_start) * (pct / 100.0)
+                        if "Cube statistics" not in line:
+                            m = _PCT_RE.search(line)
+                            if m:
+                                pct = min(100, max(0, int(m.group(1))))
+                                rec.progress_pct = pct_start + (pct_end - pct_start) * (pct / 100.0)
                         rec.message = line[:160]
             elif ch:
                 buf.append(ch)
@@ -178,16 +251,25 @@ class JobManager:
 
     def start_demo_embeddings(self, survey_id: str, tag: str = "demo", offset_stride: int = 5) -> JobStatus:
         survey = self.seismic_store.get_survey(survey_id)
-        rec = self._register_job("demo-embeddings", survey_id, f"Generating demo embeddings ({tag})")
+        rec = self._register_job(
+            "demo-embeddings", survey_id, f"Generating demo embeddings ({tag})", tag=tag
+        )
         self.latent_store.release_set(survey_id, tag)
 
         def _worker() -> None:
             with self._lock:
+                if rec.cancel_requested:
+                    rec.status = "cancelled"
+                    rec.message = "Cancelled by user"
+                    rec.finished_at = _now_iso()
+                    return
                 rec.status = "running"
                 rec.progress_pct = 2.0
             try:
                 def _cb(pct: float, msg: str) -> None:
                     with self._lock:
+                        if rec.cancel_requested:
+                            raise _JobCancelled("Cancelled by user")
                         rec.progress_pct = pct
                         rec.message = msg
                         rec.logs_tail.append(msg)
@@ -201,20 +283,44 @@ class JobManager:
                     summarizer_script=self.settings.embedders_dir / "offset_direction_summarizer.py",
                     progress_callback=_cb,
                 )
+                with self._lock:
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                        if rec.finished_at is None:
+                            rec.finished_at = _now_iso()
+                        return
                 self.on_rescan()
                 with self._lock:
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                        if rec.finished_at is None:
+                            rec.finished_at = _now_iso()
+                        return
                     rec.status = "completed"
                     rec.progress_pct = 100.0
                     rec.message = f"Generated {patch_npz.name} and {summary_npz.name}"
                     rec.output_path = str(patch_npz)
                     rec.finished_at = _now_iso()
+            except _JobCancelled:
+                with self._lock:
+                    rec.status = "cancelled"
+                    rec.message = "Cancelled by user"
+                    if rec.finished_at is None:
+                        rec.finished_at = _now_iso()
             except Exception as exc:
                 log.exception("Demo embeddings job %s failed", rec.id)
                 with self._lock:
-                    rec.status = "failed"
-                    rec.message = str(exc)
-                    rec.logs_tail.append(f"ERROR: {exc}")
-                    rec.finished_at = _now_iso()
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                    else:
+                        rec.status = "failed"
+                        rec.message = str(exc)
+                        rec.logs_tail.append(f"ERROR: {exc}")
+                    if rec.finished_at is None:
+                        rec.finished_at = _now_iso()
 
         threading.Thread(target=_worker, daemon=True, name=f"job-{rec.id}").start()
         return rec.to_model()
@@ -240,11 +346,18 @@ class JobManager:
         patch_out = self.settings.data_dir / f"{survey_id}{suffix}_patch_embeddings.npz"
         summary_out = self.settings.data_dir / f"{survey_id}{suffix}_offset_summary.npz"
 
-        rec = self._register_job("embed", survey_id, f"Running prestack_patch_embedder ({tag})")
+        rec = self._register_job(
+            "embed", survey_id, f"Running prestack_patch_embedder ({tag})", tag=tag
+        )
         self.latent_store.release_set(survey_id, tag)
 
         def _worker() -> None:
             with self._lock:
+                if rec.cancel_requested:
+                    rec.status = "cancelled"
+                    rec.message = "Cancelled by user"
+                    rec.finished_at = _now_iso()
+                    return
                 rec.status = "running"
                 rec.progress_pct = 1.0
             try:
@@ -271,12 +384,13 @@ class JobManager:
                     cmd.extend(["--offsets", offsets])
 
                 rc = self._run_subprocess(rec, cmd, 0.0, 85.0 if auto_summarize else 100.0)
-                if rec.cancel_requested:
-                    with self._lock:
+                with self._lock:
+                    if rec.cancel_requested:
                         rec.status = "cancelled"
                         rec.message = "Cancelled by user"
-                        rec.finished_at = _now_iso()
-                    return
+                        if rec.finished_at is None:
+                            rec.finished_at = _now_iso()
+                        return
                 if rc != 0:
                     with self._lock:
                         rec.status = "failed"
@@ -284,47 +398,69 @@ class JobManager:
                         rec.finished_at = _now_iso()
                     return
 
+                skipped_summary_msg: str | None = None
                 if auto_summarize:
-                    with self._lock:
-                        rec.message = "Running offset_direction_summarizer"
-                    sum_script = self.settings.embedders_dir / "offset_direction_summarizer.py"
-                    sum_cmd = [
-                        sys.executable,
-                        str(sum_script),
-                        "--input",
-                        str(patch_out),
-                        "--output",
-                        str(summary_out),
-                        "--force",
-                    ]
-                    rc2 = self._run_subprocess(rec, sum_cmd, 85.0, 100.0)
-                    if rec.cancel_requested:
+                    if not _has_distinct_abs_offsets(patch_out):
+                        skipped_summary_msg = (
+                            f"Completed embedding ({tag}); skipped offset summary "
+                            "(need >= 2 distinct |offset| values)"
+                        )
                         with self._lock:
-                            rec.status = "cancelled"
-                            rec.message = "Cancelled by user"
-                            rec.finished_at = _now_iso()
-                        return
-                    if rc2 != 0:
+                            rec.logs_tail.append(skipped_summary_msg)
+                            rec.message = skipped_summary_msg
+                    else:
                         with self._lock:
-                            rec.status = "failed"
-                            rec.message = f"offset_direction_summarizer exited with code {rc2}"
-                            rec.finished_at = _now_iso()
-                        return
+                            rec.message = "Running offset_direction_summarizer"
+                        sum_script = self.settings.embedders_dir / "offset_direction_summarizer.py"
+                        sum_cmd = [
+                            sys.executable,
+                            str(sum_script),
+                            "--input",
+                            str(patch_out),
+                            "--output",
+                            str(summary_out),
+                            "--force",
+                        ]
+                        rc2 = self._run_subprocess(rec, sum_cmd, 85.0, 100.0)
+                        with self._lock:
+                            if rec.cancel_requested:
+                                rec.status = "cancelled"
+                                rec.message = "Cancelled by user"
+                                if rec.finished_at is None:
+                                    rec.finished_at = _now_iso()
+                                return
+                        if rc2 != 0:
+                            with self._lock:
+                                rec.status = "failed"
+                                rec.message = f"offset_direction_summarizer exited with code {rc2}"
+                                rec.finished_at = _now_iso()
+                            return
 
                 self.on_rescan()
                 with self._lock:
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                        if rec.finished_at is None:
+                            rec.finished_at = _now_iso()
+                        return
                     rec.status = "completed"
                     rec.progress_pct = 100.0
-                    rec.message = f"Completed embedding ({tag})"
+                    rec.message = skipped_summary_msg or f"Completed embedding ({tag})"
                     rec.output_path = str(patch_out)
                     rec.finished_at = _now_iso()
             except Exception as exc:
                 log.exception("Embed job %s failed", rec.id)
                 with self._lock:
-                    rec.status = "failed"
-                    rec.message = str(exc)
-                    rec.logs_tail.append(f"ERROR: {exc}")
-                    rec.finished_at = _now_iso()
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                    else:
+                        rec.status = "failed"
+                        rec.message = str(exc)
+                        rec.logs_tail.append(f"ERROR: {exc}")
+                    if rec.finished_at is None:
+                        rec.finished_at = _now_iso()
 
         threading.Thread(target=_worker, daemon=True, name=f"job-{rec.id}").start()
         return rec.to_model()
@@ -341,11 +477,18 @@ class JobManager:
         suffix = f"_{tag}" if tag and tag != "default" else ""
         summary_out = patch_in.with_name(f"{survey_id}{suffix}_offset_summary.npz")
 
-        rec = self._register_job("summarize", survey_id, f"Running offset_direction_summarizer ({tag})")
+        rec = self._register_job(
+            "summarize", survey_id, f"Running offset_direction_summarizer ({tag})", tag=tag
+        )
         self.latent_store.release_set(survey_id, tag)
 
         def _worker() -> None:
             with self._lock:
+                if rec.cancel_requested:
+                    rec.status = "cancelled"
+                    rec.message = "Cancelled by user"
+                    rec.finished_at = _now_iso()
+                    return
                 rec.status = "running"
                 rec.progress_pct = 5.0
             try:
@@ -363,12 +506,13 @@ class JobManager:
                     cmd.append("--exclude-zero-offset")
 
                 rc = self._run_subprocess(rec, cmd, 5.0, 100.0)
-                if rec.cancel_requested:
-                    with self._lock:
+                with self._lock:
+                    if rec.cancel_requested:
                         rec.status = "cancelled"
                         rec.message = "Cancelled by user"
-                        rec.finished_at = _now_iso()
-                    return
+                        if rec.finished_at is None:
+                            rec.finished_at = _now_iso()
+                        return
                 if rc != 0:
                     with self._lock:
                         rec.status = "failed"
@@ -378,6 +522,12 @@ class JobManager:
 
                 self.on_rescan()
                 with self._lock:
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                        if rec.finished_at is None:
+                            rec.finished_at = _now_iso()
+                        return
                     rec.status = "completed"
                     rec.progress_pct = 100.0
                     rec.message = f"Completed offset summary ({tag})"
@@ -386,10 +536,15 @@ class JobManager:
             except Exception as exc:
                 log.exception("Summarize job %s failed", rec.id)
                 with self._lock:
-                    rec.status = "failed"
-                    rec.message = str(exc)
-                    rec.logs_tail.append(f"ERROR: {exc}")
-                    rec.finished_at = _now_iso()
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                    else:
+                        rec.status = "failed"
+                        rec.message = str(exc)
+                        rec.logs_tail.append(f"ERROR: {exc}")
+                    if rec.finished_at is None:
+                        rec.finished_at = _now_iso()
 
         threading.Thread(target=_worker, daemon=True, name=f"job-{rec.id}").start()
         return rec.to_model()
@@ -412,15 +567,21 @@ class JobManager:
 
         def _worker() -> None:
             with self._lock:
+                if rec.cancel_requested:
+                    rec.status = "cancelled"
+                    rec.message = "Cancelled by user"
+                    rec.finished_at = _now_iso()
+                    return
                 rec.status = "running"
             try:
                 rc = self._run_subprocess(rec, cmd, 0.0, 100.0)
-                if rec.cancel_requested:
-                    with self._lock:
+                with self._lock:
+                    if rec.cancel_requested:
                         rec.status = "cancelled"
                         rec.message = "Cancelled by user"
-                        rec.finished_at = _now_iso()
-                    return
+                        if rec.finished_at is None:
+                            rec.finished_at = _now_iso()
+                        return
                 if rc != 0:
                     with self._lock:
                         rec.status = "failed"
@@ -429,15 +590,26 @@ class JobManager:
                     return
                 self.on_rescan()
                 with self._lock:
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                        if rec.finished_at is None:
+                            rec.finished_at = _now_iso()
+                        return
                     rec.status = "completed"
                     rec.progress_pct = 100.0
                     rec.message = "Preprocessing completed"
                     rec.finished_at = _now_iso()
             except Exception as exc:
                 with self._lock:
-                    rec.status = "failed"
-                    rec.message = str(exc)
-                    rec.finished_at = _now_iso()
+                    if rec.cancel_requested:
+                        rec.status = "cancelled"
+                        rec.message = "Cancelled by user"
+                    else:
+                        rec.status = "failed"
+                        rec.message = str(exc)
+                    if rec.finished_at is None:
+                        rec.finished_at = _now_iso()
 
         threading.Thread(target=_worker, daemon=True, name=f"job-{rec.id}").start()
         return rec.to_model()

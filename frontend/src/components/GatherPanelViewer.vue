@@ -541,12 +541,14 @@ function onPointerUp(e: PointerEvent) {
   const loc = gp.value.locations[hit.gatherIdx]
   if (!loc) return
 
-  const offForPick = store.gatherSyncOffsetOnPick ? hit.offIdx : undefined
   if (store.pickMode && !e.shiftKey) {
-    void store.pickFeature(loc.il_idx, loc.xl_idx, hit.sampleIdx, offForPick ?? hit.offIdx, true)
-    if (store.gatherSyncOffsetOnPick) {
-      store.setCursor({ offsetIndex: hit.offIdx })
-    }
+    void store.pickFeature(
+      loc.il_idx,
+      loc.xl_idx,
+      hit.sampleIdx,
+      hit.offIdx,
+      store.gatherSyncOffsetOnPick,
+    )
   } else {
     store.setCursor({
       ilIdx: loc.il_idx,

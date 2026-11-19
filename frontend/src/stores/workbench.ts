@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import {
+  abortSlot,
   cancelJob,
   decodeFloat32Base64,
   fetchAttribute,
@@ -220,7 +221,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   function clampIndex(val: number, maxExclusive: number): number {
-    if (maxExclusive <= 0) return 0
+    if (!maxExclusive || !Number.isFinite(maxExclusive) || maxExclusive <= 0) return 0
     return Math.max(0, Math.min(maxExclusive - 1, Math.round(val)))
   }
 
@@ -251,7 +252,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (!target) return
 
     activeSurveyId.value = target.id
-    const [nIl, nXl, nSamples, nOffsets] = target.shape
+    const [nIl, nXl, nSamples] = target.shape
+    const nOffsets = target.shape[3] ?? 1
 
     ilIdx.value = clampIndex(Math.floor(nIl / 2), nIl)
     xlIdx.value = clampIndex(Math.floor(nXl / 2), nXl)
@@ -319,6 +321,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
             match.embedding_sets[0] ??
             null
           applyEmbeddingSetDefaults(curSet)
+          if (
+            overlaySource.value === 'attribute' &&
+            (!curSet || curSet.available_attributes.length === 0)
+          ) {
+            overlaySource.value = curSet && curSet.available_modes.length > 0 ? 'similarity' : 'off'
+          }
+          if (overlaySource.value === 'similarity' && featurePick.value && curSet) {
+            void runSimilarityQuery()
+          } else if (overlaySource.value === 'attribute' && selectedAttribute.value && curSet) {
+            void loadAttribute()
+          }
         } else {
           selectSurvey(sList[0].id)
         }
@@ -342,6 +355,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       // Touch LRU
       sectionCache.delete(cacheKey)
       sectionCache.set(cacheKey, cached)
+      abortSlot(`section:${axis}`)
+      inFlightSections.delete(axis)
+      sectionLoading.value = { ...sectionLoading.value, [axis]: false }
       if (idx === getAxisIndex(axis)) {
         sections.value = { ...sections.value, [axis]: cached }
       }
@@ -414,10 +430,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function setCursor(
     next: Partial<{ ilIdx: number; xlIdx: number; sampleIdx: number; offsetIndex: number }>,
+    options?: { skipSimilarity?: boolean },
   ) {
     const survey = activeSurvey.value
     if (!survey) return
-    const [nIl, nXl, nSamples, nOffsets] = survey.shape
+    const [nIl, nXl, nSamples] = survey.shape
+    const nOffsets = survey.shape[3] ?? 1
 
     let ilChanged = false
     let xlChanged = false
@@ -460,6 +478,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         ensureSection('sample'),
       ])
       if (
+        !options?.skipSimilarity &&
         featurePick.value &&
         overlaySource.value === 'similarity' &&
         similarityMode.value === 'active_offset'
@@ -477,7 +496,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   async function loadGatherPanel() {
     const survey = activeSurvey.value
-    if (!survey) return
+    if (!survey || !survey.is_4d) return
     const [nIl, nXl] = survey.shape
     gatherIlStartIdx.value = clampIndex(gatherIlStartIdx.value, nIl)
     gatherXlStartIdx.value = clampIndex(gatherXlStartIdx.value, nXl)
@@ -515,16 +534,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     xl: number,
     sample: number,
     offIdx?: number,
-    syncCursor = true,
+    syncOffset = true,
   ) {
     const survey = activeSurvey.value
     if (!survey) return
-    const [nIl, nXl, nSamples, nOffsets] = survey.shape
+    const [nIl, nXl, nSamples] = survey.shape
+    const nOffsets = survey.shape[3] ?? 1
 
     const cIl = clampIndex(il, nIl)
     const cXl = clampIndex(xl, nXl)
     const cSample = clampIndex(sample, nSamples)
-    const cOff = clampIndex(offIdx !== undefined ? offIdx : offsetIndex.value, nOffsets)
+    const cOff = clampIndex(offIdx ?? offsetIndex.value, nOffsets)
 
     featurePick.value = {
       il_idx: cIl,
@@ -533,14 +553,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       offset_idx: cOff,
     }
 
-    if (syncCursor) {
-      setCursor({
+    setCursor(
+      {
         ilIdx: cIl,
         xlIdx: cXl,
         sampleIdx: cSample,
-        offsetIndex: offIdx !== undefined ? cOff : undefined,
-      })
-    }
+        offsetIndex: syncOffset && offIdx !== undefined ? cOff : undefined,
+      },
+      { skipSimilarity: true },
+    )
 
     if (activeEmbeddingSet.value) {
       if (overlaySource.value === 'off') {
@@ -611,10 +632,22 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const survey = activeSurvey.value
     if (!survey) return
     const embSet = survey.embedding_sets.find((e) => e.id === setId) ?? null
+    similarityResult.value = null
+    similarityVolume.value = null
+    attributeResult.value = null
+    attributeVolume.value = null
     applyEmbeddingSetDefaults(embSet)
-    if (overlaySource.value === 'similarity' && featurePick.value) {
+
+    if (
+      overlaySource.value === 'attribute' &&
+      (!embSet || embSet.available_attributes.length === 0)
+    ) {
+      overlaySource.value = embSet && embSet.available_modes.length > 0 ? 'similarity' : 'off'
+    }
+
+    if (overlaySource.value === 'similarity' && featurePick.value && embSet) {
       void runSimilarityQuery()
-    } else if (overlaySource.value === 'attribute' && selectedAttribute.value) {
+    } else if (overlaySource.value === 'attribute' && selectedAttribute.value && embSet) {
       void loadAttribute()
     }
   }

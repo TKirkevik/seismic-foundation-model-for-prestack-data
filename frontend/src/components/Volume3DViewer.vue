@@ -44,6 +44,7 @@ let gatherGroup: THREE.Group | null = null
 let pickGroup: THREE.Group | null = null
 let cloudMesh: THREE.InstancedMesh | null = null
 let cloudMaxCapacity = 0
+let cloudGeometryKey = ''
 let visiblePatchCoords = new Int32Array(0) // [il_idx, xl_idx, sample_idx] per visible instance
 let visiblePatchValues = new Float32Array(0)
 
@@ -411,10 +412,31 @@ function updateFeaturePickMarker() {
   halo.position.copy(pos)
   pickGroup.add(halo)
 
-  // Patch wireframe box
-  const pw = (patchSize / Math.max(1, nXl)) * sizeX
-  const ph = (patchSize / Math.max(1, nSamples)) * sizeY
-  const pd = (patchSize / Math.max(1, nIl)) * sizeZ
+  // Patch wireframe box (snapped to the queried patch when available)
+  const simRes = store.similarityResult
+  const simMatchesPick =
+    simRes !== null &&
+    simRes.pick.il_idx === fp.il_idx &&
+    simRes.pick.xl_idx === fp.xl_idx &&
+    simRes.pick.sample_idx === fp.sample_idx
+  const boxPatchSize = simMatchesPick ? simRes.patch_size || patchSize : patchSize
+  let boxPos = pos
+  if (simMatchesPick && simRes.pick.patch_idx.length >= 3) {
+    const [pi, pj, pk] = simRes.pick.patch_idx
+    const half = boxPatchSize * 0.5
+    const ilStart = simRes.il_patch_start[pi] ?? pi * boxPatchSize
+    const xlStart = simRes.xl_patch_start[pj] ?? pj * boxPatchSize
+    const tStart = simRes.t_patch_start[pk] ?? pk * boxPatchSize
+    boxPos = indexToWorld(
+      Math.min(nIl - 1, ilStart + half - 0.5),
+      Math.min(nXl - 1, xlStart + half - 0.5),
+      Math.min(nSamples - 1, tStart + half - 0.5),
+    )
+  }
+
+  const pw = (boxPatchSize / Math.max(1, nXl)) * sizeX
+  const ph = (boxPatchSize / Math.max(1, nSamples)) * sizeY
+  const pd = (boxPatchSize / Math.max(1, nIl)) * sizeZ
   const boxGeo = new THREE.BoxGeometry(pw, ph, pd)
   const edges = new THREE.EdgesGeometry(boxGeo)
   boxGeo.dispose()
@@ -422,23 +444,34 @@ function updateFeaturePickMarker() {
     edges,
     new THREE.LineBasicMaterial({ color: 0x22d3ee }),
   )
-  line.position.copy(pos)
+  line.position.copy(boxPos)
   pickGroup.add(line)
+}
+
+function disposeCloudMesh() {
+  if (!cloudMesh) return
+  scene?.remove(cloudMesh)
+  cloudMesh.geometry.dispose()
+  if (Array.isArray(cloudMesh.material)) {
+    cloudMesh.material.forEach((m) => m.dispose())
+  } else {
+    cloudMesh.material.dispose()
+  }
+  cloudMesh.dispose()
+  cloudMesh = null
+  cloudMaxCapacity = 0
+  cloudGeometryKey = ''
 }
 
 function ensureCloudMesh(capacity: number) {
   if (!scene || !survey.value) return
-  if (cloudMesh && cloudMaxCapacity >= capacity) return
-
-  if (cloudMesh) {
-    scene.remove(cloudMesh)
-    cloudMesh.geometry.dispose()
-    ;(cloudMesh.material as THREE.Material).dispose()
-    cloudMesh = null
-  }
-
   const { sizeX, sizeY, sizeZ, nIl, nXl, nSamples } = getWorldDims()
   const patchSize = store.activeOverlay?.patchSize ?? 16
+  const nextKey = `${sizeX}:${sizeY}:${sizeZ}:${nIl}:${nXl}:${nSamples}:${patchSize}`
+  if (cloudMesh && cloudMaxCapacity >= capacity && cloudGeometryKey === nextKey) return
+
+  disposeCloudMesh()
+
   const vw = Math.max(0.015, (patchSize / Math.max(1, nXl)) * sizeX * 0.74)
   const vh = Math.max(0.012, (patchSize / Math.max(1, nSamples)) * sizeY * 0.74)
   const vd = Math.max(0.015, (patchSize / Math.max(1, nIl)) * sizeZ * 0.74)
@@ -454,6 +487,7 @@ function ensureCloudMesh(capacity: number) {
   cloudMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
   cloudMesh.frustumCulled = false
   cloudMaxCapacity = capacity
+  cloudGeometryKey = nextKey
   visiblePatchCoords = new Int32Array(capacity * 3)
   visiblePatchValues = new Float32Array(capacity)
   scene.add(cloudMesh)
@@ -493,24 +527,21 @@ function updateCloud() {
   const d = ov.data
 
   for (let pi = 0; pi < nIlP; pi++) {
-    const ilCenter = Math.min(
-      nIl - 1,
-      Math.round((ov.ilPatchStart[pi] ?? pi * ov.patchSize) + half),
-    )
+    const ilStart = ov.ilPatchStart[pi] ?? pi * ov.patchSize
+    const ilCoord = Math.min(nIl - 1, ilStart + half - 0.5)
+    const ilCenter = Math.min(nIl - 1, Math.max(0, Math.round(ilCoord)))
     for (let pj = 0; pj < nXlP; pj++) {
-      const xlCenter = Math.min(
-        nXl - 1,
-        Math.round((ov.xlPatchStart[pj] ?? pj * ov.patchSize) + half),
-      )
+      const xlStart = ov.xlPatchStart[pj] ?? pj * ov.patchSize
+      const xlCoord = Math.min(nXl - 1, xlStart + half - 0.5)
+      const xlCenter = Math.min(nXl - 1, Math.max(0, Math.round(xlCoord)))
       for (let pk = 0; pk < nTP; pk++) {
         const val = d[pi * strideIl + pj * nTP + pk]
         if (val < thresh || Number.isNaN(val)) continue
 
-        const tCenter = Math.min(
-          nSamples - 1,
-          Math.round((ov.tPatchStart[pk] ?? pk * ov.patchSize) + half),
-        )
-        const wp = indexToWorld(ilCenter, xlCenter, tCenter)
+        const tStart = ov.tPatchStart[pk] ?? pk * ov.patchSize
+        const tCoord = Math.min(nSamples - 1, tStart + half - 0.5)
+        const tCenter = Math.min(nSamples - 1, Math.max(0, Math.round(tCoord)))
+        const wp = indexToWorld(ilCoord, xlCoord, tCoord)
         dummy.position.copy(wp)
 
         let norm = (val - normMin) / normSpan
@@ -522,7 +553,7 @@ function updateCloud() {
 
         cloudMesh.setMatrixAt(count, dummy.matrix)
         const [r, g, b] = sampleLUT(lut, norm)
-        color.setRGB(r / 255, g / 255, b / 255)
+        color.setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace)
         cloudMesh.setColorAt(count, color)
 
         visiblePatchCoords[count * 3] = ilCenter
@@ -634,6 +665,7 @@ onBeforeUnmount(() => {
     renderer.domElement.remove()
   }
   controls?.dispose()
+  disposeCloudMesh()
   disposeObject(scene)
   inlineTex?.dispose()
   xlineTex?.dispose()
@@ -680,7 +712,7 @@ watch(
 )
 
 watch(
-  () => store.featurePick,
+  [() => store.featurePick, () => store.similarityResult],
   () => {
     updateFeaturePickMarker()
   },
@@ -779,7 +811,7 @@ watch(showBox, (v) => {
 
       <div class="ml-auto flex items-center gap-2">
         <span class="hidden sm:inline text-[10px] text-slate-500">
-          Drag to orbit · Scroll to zoom · Click voxel to jump
+          Drag to orbit · Scroll to zoom · Click patch to jump
         </span>
         <button
           type="button"

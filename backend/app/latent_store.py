@@ -110,35 +110,53 @@ class EmbeddingSetHandle:
     _embeddings_cache: np.ndarray | None = field(default=None, init=False, repr=False)
     _summary_cache: dict[str, np.ndarray] | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
 
-    def get_embeddings(self) -> np.ndarray:
+    def _get_embeddings_unlocked(self) -> np.ndarray:
         if self.patch_path is None:
             raise ValueError(f"Embedding set '{self.id}' has no patch_embeddings file")
-        with self._lock:
-            if self._embeddings_cache is not None:
-                return self._embeddings_cache
-            if self._memmap_meta is not None:
-                shape, fortran_order, dtype, data_offset = self._memmap_meta
-                arr = np.memmap(
-                    self.patch_path,
-                    dtype=dtype,
-                    mode="r",
-                    offset=data_offset,
-                    shape=shape,
-                    order="F" if fortran_order else "C",
-                )
-                self._embeddings_cache = arr
-                return arr
-            # Compressed .npz fallback
-            with np.load(self.patch_path, allow_pickle=False) as npz:
-                arr = np.array(npz["embeddings"])
+        if self._closed:
+            raise RuntimeError("Embedding set is closed")
+        if self._embeddings_cache is not None:
+            return self._embeddings_cache
+        if self._memmap_meta is not None:
+            shape, fortran_order, dtype, data_offset = self._memmap_meta
+            arr = np.memmap(
+                self.patch_path,
+                dtype=dtype,
+                mode="r",
+                offset=data_offset,
+                shape=shape,
+                order="F" if fortran_order else "C",
+            )
             self._embeddings_cache = arr
             return arr
+        # Compressed .npz fallback
+        with np.load(self.patch_path, allow_pickle=False) as npz:
+            arr = np.array(npz["embeddings"])
+        self._embeddings_cache = arr
+        return arr
+
+    def read_offset_volume(self, off_idx: int) -> np.ndarray:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Embedding set is closed")
+            embeddings = self._get_embeddings_unlocked()
+            return np.array(embeddings[off_idx], dtype=np.float32, copy=True)
+
+    def read_zero_offset_volume(self, z_idx: np.ndarray) -> np.ndarray:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Embedding set is closed")
+            embeddings = self._get_embeddings_unlocked()
+            return np.array(embeddings[z_idx], dtype=np.float32, copy=True).mean(axis=0)
 
     def get_summary(self) -> dict[str, np.ndarray]:
         if self.summary_path is None:
             raise ValueError(f"Embedding set '{self.id}' has no offset_summary file")
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Embedding set is closed")
             if self._summary_cache is not None:
                 return self._summary_cache
             summary: dict[str, np.ndarray] = {}
@@ -161,6 +179,7 @@ class EmbeddingSetHandle:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             if isinstance(self._embeddings_cache, np.memmap):
                 mmap_obj = getattr(self._embeddings_cache, "_mmap", None)
                 if mmap_obj is not None:
@@ -173,19 +192,30 @@ class EmbeddingSetHandle:
 
 
 def _discover_npz_pairs(
-    survey_id: str, directories: list[Path]
-) -> dict[str, dict[str, Path]]:
-    """Pair <survey_id>_<tag>_patch_embeddings.npz and _offset_summary.npz across directories."""
-    pairs: dict[str, dict[str, Path]] = {}
-    prefix = f"{survey_id}_"
+    survey_ids: list[str], directories: list[Path]
+) -> dict[str, dict[str, dict[str, Path]]]:
+    """Pair <survey_id>_<tag>_patch_embeddings.npz and _offset_summary.npz across directories.
+
+    Each .npz binds only to the longest matching ``<survey_id>_`` prefix.
+    """
+    pairs: dict[str, dict[str, dict[str, Path]]] = {sid: {} for sid in survey_ids}
+    sorted_ids = sorted(set(survey_ids), key=len, reverse=True)
+    if not sorted_ids:
+        return pairs
+
     for directory in directories:
         if not directory.is_dir():
             continue
         for npz_path in sorted(directory.glob("*.npz"), key=lambda p: p.name.lower()):
             name = npz_path.name
-            if not name.startswith(prefix):
+            matched_sid: str | None = None
+            for sid in sorted_ids:
+                if name.startswith(f"{sid}_"):
+                    matched_sid = sid
+                    break
+            if matched_sid is None:
                 continue
-            rem = name[len(prefix) :]
+            rem = name[len(matched_sid) + 1 :]
             if rem == "patch_embeddings.npz":
                 tag, kind = "default", "patch"
             elif rem.endswith("_patch_embeddings.npz"):
@@ -200,7 +230,7 @@ def _discover_npz_pairs(
                 continue
             if not tag:
                 tag = "default"
-            slot = pairs.setdefault(tag, {})
+            slot = pairs[matched_sid].setdefault(tag, {})
             slot.setdefault(kind, npz_path.resolve())
     return pairs
 
@@ -345,9 +375,10 @@ class LatentStore:
 
     def scan(self, survey_ids: list[str]) -> None:
         search_dirs = self._search_dirs()
+        all_pairs = _discover_npz_pairs(survey_ids, search_dirs)
         new_sets: dict[str, dict[str, EmbeddingSetHandle]] = {}
         for survey_id in survey_ids:
-            pairs = _discover_npz_pairs(survey_id, search_dirs)
+            pairs = all_pairs.get(survey_id, {})
             survey_sets: dict[str, EmbeddingSetHandle] = {}
             for tag, paths in pairs.items():
                 try:
@@ -428,17 +459,15 @@ class LatentStore:
         device = get_device()
 
         if mode == "active_offset":
-            embeddings = handle.get_embeddings()
-            vol = embeddings[nearest_emb_off_idx]
+            vol = handle.read_offset_volume(nearest_emb_off_idx)
             sim_t = _cosine_similarity_volume(vol, p_il, p_xl, p_t, whiten, device)
         elif mode == "zero_offset":
             if handle.summary_path is not None:
                 summary = handle.get_summary()
                 vol = summary["zero_offset"]
             else:
-                embeddings = handle.get_embeddings()
                 z_idx = _zero_offset_indices(handle.embedded_offsets)
-                vol = embeddings[z_idx].astype(np.float32).mean(axis=0)
+                vol = handle.read_zero_offset_volume(z_idx)
             sim_t = _cosine_similarity_volume(vol, p_il, p_xl, p_t, whiten, device)
         elif mode == "offset_direction":
             summary = handle.get_summary()
@@ -581,7 +610,8 @@ class LatentStore:
 
     def release_set(self, survey_id: str, embedding_set_id: str) -> None:
         with self._lock:
-            handle = self._sets.get(survey_id, {}).get(embedding_set_id)
+            survey_map = self._sets.get(survey_id)
+            handle = survey_map.pop(embedding_set_id, None) if survey_map is not None else None
         if handle is not None:
             handle.close()
 

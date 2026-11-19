@@ -17,7 +17,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from .config import Settings, settings as default_settings  # noqa: E402
 from .device import get_device_info  # noqa: E402
-from .jobs import JobManager  # noqa: E402
+from .jobs import JobConflictError, JobManager  # noqa: E402
 from .latent_store import LatentStore  # noqa: E402
 from .models import (  # noqa: E402
     AttributeResponse,
@@ -251,6 +251,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 tag=body.tag,
                 offset_stride=body.offset_stride,
             )
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, FileNotFoundError) as exc:
@@ -267,6 +269,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 batch_size=body.batch_size,
                 auto_summarize=body.auto_summarize,
             )
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, FileNotFoundError) as exc:
@@ -280,6 +284,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 tag=body.tag,
                 exclude_zero_offset=body.exclude_zero_offset,
             )
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, FileNotFoundError) as exc:
@@ -292,6 +298,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 survey_id=body.survey_id,
                 params=body.params,
             )
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, FileNotFoundError) as exc:

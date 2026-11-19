@@ -223,7 +223,11 @@ export async function startDemoEmbeddingsJob(payload: DemoEmbeddingsRequest): Pr
   const res = await fetch('/api/jobs/demo-embeddings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      survey_id: payload.survey_id,
+      ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      ...(payload.offset_stride !== undefined ? { offset_stride: payload.offset_stride } : {}),
+    }),
   })
   return parseJsonOrThrow<JobInfo>(res)
 }
@@ -232,7 +236,16 @@ export async function startEmbedJob(payload: EmbedJobRequest): Promise<JobInfo> 
   const res = await fetch('/api/jobs/embed', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      survey_id: payload.survey_id,
+      ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      ...(payload.offsets !== undefined ? { offsets: payload.offsets } : {}),
+      ...(payload.num_overlap_patches !== undefined
+        ? { num_overlap_patches: payload.num_overlap_patches }
+        : {}),
+      ...(payload.batch_size !== undefined ? { batch_size: payload.batch_size } : {}),
+      ...(payload.auto_summarize !== undefined ? { auto_summarize: payload.auto_summarize } : {}),
+    }),
   })
   return parseJsonOrThrow<JobInfo>(res)
 }
@@ -241,7 +254,13 @@ export async function startSummarizeJob(payload: SummarizeJobRequest): Promise<J
   const res = await fetch('/api/jobs/summarize', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      survey_id: payload.survey_id,
+      ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      ...(payload.exclude_zero_offset !== undefined
+        ? { exclude_zero_offset: payload.exclude_zero_offset }
+        : {}),
+    }),
   })
   return parseJsonOrThrow<JobInfo>(res)
 }

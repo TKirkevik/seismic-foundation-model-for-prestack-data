@@ -30,7 +30,7 @@ export interface SurveySummary {
   name: string
   sgz_path: string
   is_4d: boolean
-  shape: [number, number, number, number] // [n_il, n_xl, n_samples, n_offsets]
+  shape: [number, number, number] | [number, number, number, number] // [n_il, n_xl, n_samples(, n_offsets)]
   ilines: number[]
   xlines: number[]
   samples: number[]
@@ -138,34 +138,37 @@ export interface AttributeResponse {
   values_b64: string
 }
 
-export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+export type JobStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'unsupported'
 
 export interface JobInfo {
   id: string
-  type?: string
-  kind?: string
-  title?: string
-  survey_id?: string
+  job_type: string
+  survey_id: string | null
   status: JobStatus | string
-  progress?: number
-  stage?: string
-  message?: string
-  error?: string | null
-  logs?: string[]
-  log_tail?: string
-  created_at?: string
-  updated_at?: string
+  progress_pct: number
+  message: string
+  logs_tail: string[]
+  created_at: string
+  finished_at: string | null
+  output_path: string | null
 }
 
 export interface DemoEmbeddingsRequest {
   survey_id: string
-  embedding_set_id?: string
+  tag?: string
+  offset_stride?: number
 }
 
 export interface EmbedJobRequest {
   survey_id: string
-  embedding_set_id?: string
-  offsets?: string
+  tag?: string
+  offsets?: string | null
   num_overlap_patches?: number
   batch_size?: number
   auto_summarize?: boolean
@@ -173,7 +176,7 @@ export interface EmbedJobRequest {
 
 export interface SummarizeJobRequest {
   survey_id: string
-  embedding_set_id?: string
+  tag?: string
   exclude_zero_offset?: boolean
 }
 
