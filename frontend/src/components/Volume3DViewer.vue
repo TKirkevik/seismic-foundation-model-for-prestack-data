@@ -6,6 +6,12 @@ import { Box, Eye, Layers, RotateCcw } from 'lucide-vue-next'
 import type { SectionAxis, SectionResponseData } from '../api/types'
 import { useWorkbenchStore } from '../stores/workbench'
 import { getOverlayLUT, getSeismicLUT, sampleLUT } from '../utils/colormaps'
+import {
+  dragSurfaceNormal,
+  sliceIndexToWorld,
+  worldToSliceIndex,
+  type SliceAxis,
+} from '../utils/sliceDrag'
 
 const store = useWorkbenchStore()
 const containerRef = ref<HTMLDivElement | null>(null)
@@ -51,6 +57,20 @@ const raycaster = new THREE.Raycaster()
 const pointerNdc = new THREE.Vector2()
 let pointerDownX = 0
 let pointerDownY = 0
+
+// Shift+drag on a slice plane moves that slice along its axis. The plane follows the
+// pointer live; the shared cursor (and hence section fetches) is updated on release.
+interface SliceDragState {
+  axis: SliceAxis
+  mesh: THREE.Mesh
+  surface: THREE.Plane
+  pointerId: number
+  index: number
+  startIndex: number
+}
+let sliceDrag: SliceDragState | null = null
+const sliceDragReadout = ref<string | null>(null)
+const dragHit = new THREE.Vector3()
 
 function getWorldDims() {
   const s = survey.value
@@ -128,6 +148,13 @@ function initThree() {
     }
   }
   animate()
+
+  // Capture phase on the container runs before OrbitControls' listeners on the canvas,
+  // so a shift-drag that grabs a slice never starts an orbit/pan.
+  container.addEventListener('pointerdown', onSliceDragStart, { capture: true })
+  container.addEventListener('pointermove', onSliceDragMove, { capture: true })
+  container.addEventListener('pointerup', onSliceDragEnd, { capture: true })
+  container.addEventListener('pointercancel', onSliceDragEnd, { capture: true })
 
   renderer.domElement.addEventListener('pointerdown', onPointerDown)
   renderer.domElement.addEventListener('pointermove', onPointerMove)
@@ -556,6 +583,105 @@ function getHitCloudInstance(clientX: number, clientY: number): number | null {
   return null
 }
 
+function setPointerNdc(clientX: number, clientY: number) {
+  if (!renderer) return
+  const rect = renderer.domElement.getBoundingClientRect()
+  pointerNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1
+  pointerNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1
+}
+
+function currentSliceIndex(axis: SliceAxis): number {
+  if (axis === 'inline') return store.ilIdx
+  if (axis === 'xline') return store.xlIdx
+  return store.sampleIdx
+}
+
+function sliceLabel(axis: SliceAxis, idx: number): string {
+  const s = survey.value
+  if (axis === 'inline') return `IL ${s?.ilines[idx] ?? idx}`
+  if (axis === 'xline') return `XL ${s?.xlines[idx] ?? idx}`
+  return `T ${s?.samples[idx] ?? idx} ms`
+}
+
+function onSliceDragStart(e: PointerEvent) {
+  if (!e.shiftKey || e.button !== 0 || !showSlices.value) return
+  if (!renderer || !camera || !controls || !survey.value || e.target !== renderer.domElement) return
+  const candidates: [THREE.Mesh, SliceAxis][] = []
+  if (inlineMesh?.visible) candidates.push([inlineMesh, 'inline'])
+  if (xlineMesh?.visible) candidates.push([xlineMesh, 'xline'])
+  if (sampleMesh?.visible) candidates.push([sampleMesh, 'sample'])
+  if (!candidates.length) return
+
+  setPointerNdc(e.clientX, e.clientY)
+  raycaster.setFromCamera(pointerNdc, camera)
+  const hit = raycaster.intersectObjects(
+    candidates.map(([m]) => m),
+    false,
+  )[0]
+  if (!hit) return
+  const axis = candidates.find(([m]) => m === hit.object)![1]
+  const camDir = camera.getWorldDirection(new THREE.Vector3())
+  const n = dragSurfaceNormal(axis, [camDir.x, camDir.y, camDir.z])
+  if (!n) return // looking straight down this slice's axis: leave the gesture to OrbitControls
+
+  e.preventDefault()
+  e.stopPropagation()
+  controls.enabled = false
+  renderer.domElement.setPointerCapture(e.pointerId)
+  renderer.domElement.style.cursor = 'grabbing'
+  const index = currentSliceIndex(axis)
+  sliceDrag = {
+    axis,
+    mesh: hit.object as THREE.Mesh,
+    surface: new THREE.Plane().setFromNormalAndCoplanarPoint(new THREE.Vector3(...n), hit.point),
+    pointerId: e.pointerId,
+    index,
+    startIndex: index,
+  }
+  sliceDragReadout.value = sliceLabel(axis, index)
+}
+
+function onSliceDragMove(e: PointerEvent) {
+  if (!sliceDrag || e.pointerId !== sliceDrag.pointerId || !camera) return
+  e.stopPropagation()
+  setPointerNdc(e.clientX, e.clientY)
+  raycaster.setFromCamera(pointerNdc, camera)
+  if (!raycaster.ray.intersectPlane(sliceDrag.surface, dragHit)) return
+  const { axis, mesh } = sliceDrag
+  const coord = axis === 'inline' ? dragHit.z : axis === 'xline' ? dragHit.x : dragHit.y
+  const dims = getWorldDims()
+  const index = worldToSliceIndex(axis, coord, dims)
+  if (index === sliceDrag.index) return
+  sliceDrag.index = index
+  const w = sliceIndexToWorld(axis, index, dims)
+  if (axis === 'inline') mesh.position.z = w
+  else if (axis === 'xline') mesh.position.x = w
+  else mesh.position.y = w
+  sliceDragReadout.value = sliceLabel(axis, index)
+}
+
+function onSliceDragEnd(e: PointerEvent) {
+  if (!sliceDrag || e.pointerId !== sliceDrag.pointerId) return
+  e.stopPropagation()
+  const { axis, index, startIndex } = sliceDrag
+  sliceDrag = null
+  sliceDragReadout.value = null
+  if (controls) controls.enabled = true
+  if (renderer) {
+    if (renderer.domElement.hasPointerCapture(e.pointerId)) {
+      renderer.domElement.releasePointerCapture(e.pointerId)
+    }
+    renderer.domElement.style.cursor = ''
+  }
+  if (e.type === 'pointercancel' || index === startIndex) {
+    updateSlicePositions()
+    return
+  }
+  if (axis === 'inline') store.setCursor({ ilIdx: index })
+  else if (axis === 'xline') store.setCursor({ xlIdx: index })
+  else store.setCursor({ sampleIdx: index })
+}
+
 function onPointerDown(e: PointerEvent) {
   pointerDownX = e.clientX
   pointerDownY = e.clientY
@@ -626,6 +752,13 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   resizeObs?.disconnect()
+  const container = containerRef.value
+  if (container) {
+    container.removeEventListener('pointerdown', onSliceDragStart, { capture: true })
+    container.removeEventListener('pointermove', onSliceDragMove, { capture: true })
+    container.removeEventListener('pointerup', onSliceDragEnd, { capture: true })
+    container.removeEventListener('pointercancel', onSliceDragEnd, { capture: true })
+  }
   if (animFrameId !== null) cancelAnimationFrame(animFrameId)
   if (renderer?.domElement) {
     renderer.domElement.removeEventListener('pointerdown', onPointerDown)
@@ -779,7 +912,7 @@ watch(showBox, (v) => {
 
       <div class="ml-auto flex items-center gap-2">
         <span class="hidden sm:inline text-[10px] text-slate-500">
-          Drag to orbit · Scroll to zoom · Click voxel to jump
+          Drag to orbit · Shift+drag slice to move · Scroll to zoom · Click voxel to jump
         </span>
         <button
           type="button"
@@ -794,6 +927,14 @@ watch(showBox, (v) => {
 
     <!-- Three.js Mount -->
     <div ref="containerRef" class="relative flex-1 min-h-0 overflow-hidden bg-slate-950">
+      <!-- Slice drag readout -->
+      <div
+        v-if="sliceDragReadout"
+        class="absolute top-2.5 left-3 px-2.5 py-1 rounded bg-slate-950/90 border border-cyan-500/40 text-[11px] font-mono-num text-cyan-200 pointer-events-none shadow-lg"
+      >
+        {{ sliceDragReadout }}
+      </div>
+
       <!-- Hover voxel badge -->
       <div
         v-if="hoveredPatchScore"
