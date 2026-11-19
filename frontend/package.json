@@ -1,0 +1,25 @@
+{
+  "name": "seismic-prestack-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "lucide-vue-next": "^0.511.0",
+    "pinia": "^3.0.2",
+    "three": "^0.176.0",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.6",
+    "@types/three": "^0.176.0",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "tailwindcss": "^4.1.6",
+    "typescript": "^5.8.3",
+    "vue-tsc": "^2.2.10"
+  }
+}

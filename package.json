@@ -1,0 +1,12 @@
+{
+  "name": "seismic-foundation-model-for-prestack-data",
+  "private": true,
+  "scripts": {
+    "start": "concurrently -n backend,frontend -c blue,green --kill-others-on-fail \"npm run start:backend\" \"npm run start:frontend\"",
+    "start:backend": "uv --directory backend run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload",
+    "start:frontend": "npm --prefix frontend run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
