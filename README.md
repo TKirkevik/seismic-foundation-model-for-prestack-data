@@ -12,10 +12,15 @@ latent space as a function of offset.
 | `weights/` | `config.json` + `model.safetensors` from the NCS-v1-3d-base Hugging Face repo (not tracked) |
 | `data/` | Input pre-stack volume (`.sgz`, [seismic-zfp](https://github.com/equinor/seismic-zfp) compressed) and derived `.npz` products (not tracked) |
 | `embedders/prestack_patch_embedder.py` | Step 1 – per-offset patch embeddings |
+| `embedders/patch_offset_rms.py` | Step 1b – per-patch, per-offset RMS of the input data (live-offset / mute detection) |
 | `embedders/offset_direction_summarizer.py` | Step 2 – zero-offset vector + 2-D offset basis per patch |
+| `visualization/plot_offset_summary.py` | Step 3 – PNG figures of the summary (`figures/`, not tracked) |
 
 Current dataset: `ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time.sgz` — 193 inlines × 303 crosslines ×
 1126 samples (4 ms) × 100 offsets (−4950 … +4950 m, 100 m steps; no exact zero offset).
+Note the acquisition/processing footprint in offset: the ±50 m bins are **near-offset tapered**
+(RMS ≈ 40 % of the ±350–550 m plateau) and far offsets are **stretch-muted** — live offsets reach
+only ≈ 950 m at 350 ms, ≈ 3500 m at 2300 ms, ≈ 4600 m below 3500 ms.
 
 ## Setup
 
@@ -65,50 +70,92 @@ Correctness was checked against direct model forward passes (fp32, no overlap: m
 Useful flags: `--offsets 0:100:5`, `--num-overlap-patches 0` (≈2× faster), `--dtype float32`,
 `--store-dtype float32`, `--normalize-std <value>` to reuse a previous run's statistics.
 
+## Step 1b – live-offset detection
+
+```powershell
+.\.venv\Scripts\python.exe embedders\patch_offset_rms.py --input data\ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time.sgz
+# -> data\..._patch_rms.npz : rms (n_off, n_il, n_xl, n_t) on the same patch grid  (~90 s)
+```
+
 ## Step 2 – zero-offset vector and 2-D offset basis
 
 ```powershell
 .\.venv\Scripts\python.exe embedders\offset_direction_summarizer.py `
-    --input data\ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time_ncs3d_patch_embeddings.npz
+    --input data\ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time_ncs3d_patch_embeddings.npz `
+    --rms   data\ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time_patch_rms.npz
 # -> data\..._ncs3d_offset_summary.npz
 ```
 
 For every patch, the 100 embeddings `e_h` (one per offset `h`) trace a trajectory in the 768-d
-latent space. The script describes it with a point and an orthonormal 2-D basis:
+latent space. The script describes it with a point and an orthonormal 2-D basis. Offsets with
+`|h| < --min-offset` (300 m, the near-offset taper) are never used in the fit. With `--rms`,
+an offset is additionally **live** for a patch only when its RMS is ≥ `--live-threshold` (0.2) ×
+the patch's maximum RMS over offsets; the fit, PCA and variance statistics use live offsets
+only, so muted far offsets / dead traces do not define the directions. Without `--rms` every
+offset ≥ 300 m is used — on this dataset that makes axis 1 largely "the direction from data to
+no-data".
 
 | Key | Shape | Meaning |
 |---|---|---|
-| `zero_offset` | `(…, 768)` | mean of the −50 m and +50 m embeddings (no exact zero offset exists) |
-| `offset_direction` | `(…, 768)` | **axis 1**: unit slope `b/‖b‖` of the least-squares fit `e ≈ a + b·|h|` over all offsets. Regressing on `|h|` makes the sign unambiguous: it points the way the embedding moves as offset grows. |
+| `zero_offset` | `(…, 768)` | **intercept** of the per-patch fit below, i.e. the trajectory extrapolated to `|h| = 0` from the live, un-tapered offsets (`--zero-offset nearest` gives the mean of the −50/+50 m embeddings instead — note these bins are tapered) |
+| `offset_direction` | `(…, 768)` | **axis 1**: unit slope `b/‖b‖` of the least-squares fit `e ≈ a + b·|h|` over the live offsets. Regressing on `|h|` makes the sign unambiguous: it points the way the embedding moves as offset grows. |
 | `offset_curvature` | `(…, 768)` | **axis 2**: top principal component of the across-offset variation after projecting axis 1 out; orthogonal to axis 1, oriented so its coordinate correlates positively with centred `|h|²` (points the way the trajectory bows at far offsets). |
-| `offset_coords` | `(n_off, …, 2)` | coordinates of `e_h − zero_offset` in the basis: `e_h ≈ zero_offset + c₁·direction + c₂·curvature` |
+| `offset_coords` | `(n_off, …, 2)` | coordinates of `e_h − zero_offset` in the basis (all offsets): `e_h ≈ zero_offset + c₁·direction + c₂·curvature` |
 | `offset_slope` | `(…)` | `‖b‖`, latent displacement per metre of offset |
 | `offset_fit_r2` | `(…)` | fraction of across-offset variance explained by the *linear* fit in `|h|` |
 | `offset_axis_var` | `(…, 2)` | fraction of across-offset variance along each axis; the sum is the fraction captured by the plane |
+| `live_offsets`, `n_live_offsets` | `(n_off, …)`, `(…)` | live-offset mask and count; patches with < `--min-live` (4) live offsets are left as zeros |
 
-Flags: `--exclude-zero-offset` (leave ±50 m out of the fit), `--store-dtype float16`, `--chunk`.
+Flags: `--min-offset`, `--zero-offset intercept|nearest`, `--live-threshold`, `--min-live`,
+`--store-dtype float16`, `--chunk`.
 
 ### Findings on the current dataset
 
+Mute-aware fit (`--rms`, threshold 0.2, offsets ≥ 300 m; median 36 live offsets per patch, 4 % of
+patches unfittable):
+
 | | q10 | median | q90 |
 |---|---|---|---|
-| linear-in-`|h|` fit R² | 0.20 | 0.39 | 0.57 |
-| variance along axis 1 | 0.26 | 0.54 | 0.72 |
-| variance along axis 2 | 0.08 | 0.16 | 0.32 |
-| variance in the 2-D plane | 0.53 | **0.72** | 0.82 |
+| linear-in-`|h|` fit R² | 0.20 | 0.32 | 0.49 |
+| variance along axis 1 | 0.24 | 0.37 | 0.55 |
+| variance along axis 2 | 0.13 | 0.20 | 0.31 |
+| variance in the 2-D plane | 0.45 | **0.59** | 0.74 |
 
-- A single direction captures roughly half the offset-dependent variation; the straight-line
-  fit in `|h|` is weaker (0.39) because movement along axis 1 is not linear in offset.
-- Axis 2 adds a consistent **bowl-shaped** excursion: mean axis-2 coordinate ≈ 0 near zero
-  offset, ≈ −3 at mid offsets, back to ≈ 0 at the far offsets.
-- Fitting positive and negative offsets separately gives directions with median cosine 0.94
-  (q10 0.60), so regressing on `|h|` is a reasonable default; sign-asymmetric patches are a
-  minority.
+For comparison, fitting over *all* offsets with the ±50 m mean as origin gives median plane
+variance 0.72 (axis 1 0.54) — the difference is the trivial variance between live data and muted
+zeros, which the mute-aware fit removes.
+
+- With the intercept as origin the trajectories start at the origin and run out along axis 1
+  with a bowl on axis 2 (≈ −2 at ~2000 m), bending back as the mute is approached (see
+  `figures/clusters_trajectories.png`). The mean shape is shared by most k-means classes:
+  spherical k-means on `offset_direction` separates *directions* in latent space (centroid
+  cosines ≤ 0.5) that share a common *shape*; the classes form layer-conformable bands in
+  section and coherent patches in map view.
+- The tapered ±50 m embedding sits ~0.7 × the axis-1 span away from the intercept, mostly
+  *along* axis 1 (median cosine 0.69) — the model reads the low-amplitude near bins much like
+  low-amplitude far bins, i.e. axis 1 carries a strong amplitude component.
+- Fitting positive and negative offsets separately (all-offset fit) gives directions with median
+  cosine 0.94 (q10 0.60), so regressing on `|h|` is a reasonable default.
+
+## Step 3 – figures
+
+```powershell
+.\.venv\Scripts\python.exe visualization\plot_offset_summary.py `
+    --input data\ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time_ncs3d_offset_summary.npz [--ref il,xl,t] [--clusters 6] [--only ...]
+```
+
+Writes to `figures/`: scalar diagnostic slices in all three orientations (`scalars_*.png`),
+cosine similarity to a reference patch for each 768-d field (`cosine_*.png`), PCA→RGB overviews
+(`pca_rgb_*.png`), spherical k-means classes of `offset_direction` with mean trajectory per class
+(`clusters_*.png`), neighbour-cosine coherence (`coherence_*.png`) and per-patch trajectories
+for the reference column and its neighbourhood (`trajectories_*.png`). Muted offsets are drawn
+faint/grey in the trajectory plots.
 
 ## Possible next steps
 
+- Tighten `--live-threshold` (0.3–0.5) to keep the mute ramp itself out of the fit; a few
+  classes still show large axis-1 excursions right at the mute edge.
 - Separate positive/negative offset bases for the asymmetric patches.
 - Per-offset normalisation (instead of a global std) to isolate waveform/shape changes from
   amplitude-vs-offset.
-- Visualise `offset_coords` trajectories, `offset_slope` and `offset_axis_var` as maps to find
-  where offset behaviour is strong, linear or curved.
+- Cluster on trajectory *shape* (`offset_coords` over live offsets) rather than on direction.
