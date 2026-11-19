@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Cpu, Database, RefreshCw, Sparkles, Target } from 'lucide-vue-next'
+import { Cpu, Database, Eye, EyeOff, Layers, RefreshCw, Sparkles, Target } from 'lucide-vue-next'
 import { useWorkbenchStore } from '../stores/workbench'
 import { colormapGradientCss, getOverlayLUT } from '../utils/colormaps'
 import TrajectoryCard from './TrajectoryCard.vue'
@@ -9,6 +9,42 @@ const store = useWorkbenchStore()
 
 const survey = computed(() => store.activeSurvey)
 const embSet = computed(() => store.activeEmbeddingSet)
+
+const RESERVOIR_LAYERS = [
+  {
+    id: 'model',
+    label: 'Reservoir model (Eclipse grid, top/base)',
+    color: '#4ade80',
+    get: () => store.reservoirShowModel,
+    set: (v: boolean) => (store.reservoirShowModel = v),
+  },
+  {
+    id: 'horizons',
+    label: 'Top Hugin interpreted horizon',
+    color: '#f472b6',
+    get: () => store.reservoirShowHorizons,
+    set: (v: boolean) => (store.reservoirShowHorizons = v),
+  },
+  {
+    id: 'wells',
+    label: 'Well picks (Top/Base Hugin)',
+    color: '#fde047',
+    get: () => store.reservoirShowWells,
+    set: (v: boolean) => (store.reservoirShowWells = v),
+  },
+]
+
+const reservoirMetaLine = computed(() => {
+  const m = store.horizonsMeta
+  const vInt = m.hugin_interval_velocity_mps
+  const vAvg = m.v_avg_median_mps
+  const rms = m.qc_rms_ms
+  const parts: string[] = []
+  if (typeof vInt === 'number') parts.push(`V_int Hugin ${Math.round(vInt)} m/s`)
+  if (typeof vAvg === 'number') parts.push(`V_avg to top ${Math.round(vAvg)} m/s`)
+  if (typeof rms === 'number') parts.push(`well tie RMS ${rms.toFixed(1)} ms`)
+  return parts.join(' · ')
+})
 
 const MODE_LABELS: Record<string, string> = {
   active_offset: 'Active Offset',
@@ -268,6 +304,78 @@ function jumpToMatch(ilIdx: number, xlIdx: number, sampleIdx: number) {
       </section>
 
       <hr class="border-slate-800/80" />
+
+      <!-- Ground Truth: Volve reservoir in PP time -->
+      <section v-if="store.hasHorizons" class="space-y-2.5">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+            <Layers class="w-3.5 h-3.5 text-emerald-400" />
+            <span>Ground Truth</span>
+          </div>
+          <button
+            type="button"
+            class="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border transition-colors"
+            :class="
+              store.showReservoir
+                ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-200'
+                : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
+            "
+            title="Toggle the Hugin reservoir answer in all viewers"
+            @click="store.toggleReservoir()"
+          >
+            <Eye v-if="store.showReservoir" class="w-3 h-3" />
+            <EyeOff v-else class="w-3 h-3" />
+            <span>{{ store.showReservoir ? 'Shown' : 'Hidden' }}</span>
+          </button>
+        </div>
+
+        <div class="rounded border border-slate-800/90 bg-slate-900/50 p-2 space-y-2 text-[11px]">
+          <label
+            v-for="layer in RESERVOIR_LAYERS"
+            :key="layer.id"
+            class="flex items-center gap-2 cursor-pointer"
+            :class="store.showReservoir ? 'text-slate-200' : 'text-slate-500'"
+          >
+            <input
+              :checked="layer.get()"
+              type="checkbox"
+              class="accent-emerald-400 rounded"
+              :disabled="!store.showReservoir"
+              @change="layer.set(($event.target as HTMLInputElement).checked)"
+            />
+            <span class="w-3 h-0.5 rounded" :style="{ background: layer.color }" />
+            <span>{{ layer.label }}</span>
+          </label>
+
+          <div class="space-y-1 pt-1 border-t border-slate-800/80">
+            <div class="flex items-center justify-between">
+              <span class="text-slate-400">Fill Opacity</span>
+              <span class="font-mono-num text-slate-200">
+                {{ Math.round(store.reservoirOpacity * 100) }}%
+              </span>
+            </div>
+            <input
+              v-model.number="store.reservoirOpacity"
+              type="range"
+              min="0"
+              max="0.8"
+              step="0.02"
+              class="ws-slider w-full"
+              :disabled="!store.showReservoir"
+            />
+          </div>
+
+          <p v-if="reservoirMetaLine" class="text-[10px] text-slate-500 leading-snug">
+            {{ reservoirMetaLine }}
+          </p>
+          <p class="text-[10px] text-slate-600 leading-snug">
+            Volve Eclipse grid (depth) tied to the interpreted Top Hugin TWT horizon; base from
+            the well-derived Hugin interval velocity. Equinor Volve data licence.
+          </p>
+        </div>
+      </section>
+
+      <hr v-if="store.hasHorizons" class="border-slate-800/80" />
 
       <!-- Latent Exploration -->
       <section class="space-y-2.5">

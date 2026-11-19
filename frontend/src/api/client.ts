@@ -6,6 +6,7 @@ import type {
   GatherLocation,
   GatherPanelResponseData,
   HealthStatus,
+  HorizonsResponse,
   JobInfo,
   SectionAxis,
   SectionResponseData,
@@ -211,6 +212,12 @@ export async function fetchAttribute(
     { signal },
   )
   return parseJsonOrThrow<AttributeResponse>(res)
+}
+
+export async function fetchHorizons(surveyId: string, slot = 'horizons'): Promise<HorizonsResponse> {
+  const signal = getSlotSignal(slot)
+  const res = await fetch(`/api/surveys/${encodeURIComponent(surveyId)}/horizons`, { signal })
+  return parseJsonOrThrow<HorizonsResponse>(res)
 }
 
 export async function fetchJobs(): Promise<JobInfo[]> {

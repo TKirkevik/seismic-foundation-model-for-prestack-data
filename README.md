@@ -15,6 +15,8 @@ latent space as a function of offset.
 | `embedders/patch_offset_rms.py` | Step 1b – per-patch, per-offset RMS of the input data (live-offset / mute detection) |
 | `embedders/offset_direction_summarizer.py` | Step 2 – zero-offset vector + 2-D offset basis per patch |
 | `visualization/plot_offset_summary.py` | Step 3 – PNG figures of the summary (`figures/`, not tracked) |
+| `backend/`, `frontend/` | FastAPI API + Vue workbench for interactive exploration (see `backend/README.md`) |
+| `backend/scripts/build_reservoir_horizons.py` | Volve ground truth: Top Hugin TWT horizon, well picks and the Eclipse reservoir grid converted to PP time → `data/<survey>_horizons.npz`, toggleable in the viewer |
 
 Current dataset: `ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time.sgz` — 193 inlines × 303 crosslines ×
 1126 samples (4 ms) × 100 offsets (−4950 … +4950 m, 100 m steps; no exact zero offset).

@@ -46,6 +46,36 @@ class SurveySummary(BaseModel):
     default_offset_index: int
     amplitude_clip_default: float
     embedding_sets: list[EmbeddingSetSummary] = Field(default_factory=list)
+    horizon_ids: list[str] = Field(default_factory=list)
+
+
+class HorizonSurfaceResponse(BaseModel):
+    id: str
+    label: str
+    kind: Literal["horizon", "top", "base"]
+    color: str
+    grid_shape: list[int]
+    twt_min: float
+    twt_max: float
+    coverage: float
+    twt_b64: str
+
+
+class WellPick(BaseModel):
+    well: str
+    formation: str
+    il_idx: int
+    xl_idx: int
+    twt: float
+    tvdss: float
+    qualifier: str = ""
+
+
+class HorizonsResponse(BaseModel):
+    survey_id: str
+    horizons: list[HorizonSurfaceResponse]
+    well_picks: list[WellPick] = Field(default_factory=list)
+    meta: dict[str, object] = Field(default_factory=dict)
 
 
 class SimilarityRequest(BaseModel):

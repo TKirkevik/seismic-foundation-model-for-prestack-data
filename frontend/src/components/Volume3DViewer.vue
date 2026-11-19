@@ -42,6 +42,7 @@ const sampleCanvas = document.createElement('canvas')
 
 let gatherGroup: THREE.Group | null = null
 let pickGroup: THREE.Group | null = null
+let reservoirGroup: THREE.Group | null = null
 let cloudMesh: THREE.InstancedMesh | null = null
 let cloudMaxCapacity = 0
 let visiblePatchCoords = new Int32Array(0) // [il_idx, xl_idx, sample_idx] per visible instance
@@ -110,8 +111,10 @@ function initThree() {
 
   gatherGroup = new THREE.Group()
   pickGroup = new THREE.Group()
+  reservoirGroup = new THREE.Group()
   scene.add(gatherGroup)
   scene.add(pickGroup)
+  scene.add(reservoirGroup)
 
   rebuildSurveyGeometry()
   updateSliceTextures()
@@ -119,6 +122,7 @@ function initThree() {
   updateGatherCurtain()
   updateFeaturePickMarker()
   updateCloud()
+  updateReservoir()
 
   const animate = () => {
     animFrameId = requestAnimationFrame(animate)
@@ -426,6 +430,89 @@ function updateFeaturePickMarker() {
   pickGroup.add(line)
 }
 
+/** Triangulated surface through the finite bins of a (n_il, n_xl) TWT grid. */
+function buildSurfaceMesh(
+  twt: Float32Array,
+  color: string,
+  opacity: number,
+  wireframe = false,
+): THREE.Mesh | null {
+  const { sizeX, sizeY, sizeZ, nIl, nXl, nSamples } = getWorldDims()
+  const vertexOf = new Int32Array(nIl * nXl).fill(-1)
+  const positions: number[] = []
+  for (let i = 0; i < nIl; i++) {
+    for (let j = 0; j < nXl; j++) {
+      const v = twt[i * nXl + j]
+      if (!Number.isFinite(v)) continue
+      vertexOf[i * nXl + j] = positions.length / 3
+      const s = store.twtToSample(v)
+      positions.push(
+        ((j + 0.5) / nXl - 0.5) * sizeX,
+        (0.5 - (s + 0.5) / nSamples) * sizeY,
+        ((i + 0.5) / nIl - 0.5) * sizeZ,
+      )
+    }
+  }
+  if (positions.length === 0) return null
+  const indices: number[] = []
+  for (let i = 0; i < nIl - 1; i++) {
+    for (let j = 0; j < nXl - 1; j++) {
+      const a = vertexOf[i * nXl + j]
+      const b = vertexOf[i * nXl + j + 1]
+      const c = vertexOf[(i + 1) * nXl + j]
+      const d = vertexOf[(i + 1) * nXl + j + 1]
+      if (a < 0 || b < 0 || c < 0 || d < 0) continue
+      indices.push(a, b, d, a, d, c)
+    }
+  }
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+  geo.setIndex(indices)
+  geo.computeVertexNormals()
+  const mat = new THREE.MeshLambertMaterial({
+    color: new THREE.Color(color),
+    transparent: true,
+    opacity,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    wireframe,
+  })
+  return new THREE.Mesh(geo, mat)
+}
+
+function updateReservoir() {
+  if (!reservoirGroup) return
+  while (reservoirGroup.children.length > 0) {
+    const child = reservoirGroup.children[0]
+    reservoirGroup.remove(child)
+    disposeObject(child)
+  }
+  if (!survey.value || !store.showReservoir) return
+
+  const env = store.reservoirEnvelope
+  if (env) {
+    const top = buildSurfaceMesh(env.top, env.color, Math.min(0.95, store.reservoirOpacity + 0.35))
+    const base = buildSurfaceMesh(env.base, env.color, Math.min(0.8, store.reservoirOpacity + 0.1))
+    if (top) reservoirGroup.add(top)
+    if (base) reservoirGroup.add(base)
+  }
+  for (const hz of store.interpretedHorizons) {
+    const mesh = buildSurfaceMesh(hz.twt, hz.color, 0.55, true)
+    if (mesh) reservoirGroup.add(mesh)
+  }
+
+  const picks = store.visibleWellPicks
+  if (picks.length) {
+    const geo = new THREE.SphereGeometry(0.012, 8, 8)
+    const mat = new THREE.MeshBasicMaterial({ color: 0xfde047 })
+    for (const p of picks) {
+      const dot = new THREE.Mesh(geo, mat)
+      dot.position.copy(indexToWorld(p.il_idx, p.xl_idx, store.twtToSample(p.twt)))
+      reservoirGroup.add(dot)
+    }
+  }
+}
+
 function ensureCloudMesh(capacity: number) {
   if (!scene || !survey.value) return
   if (cloudMesh && cloudMaxCapacity >= capacity) return
@@ -649,6 +736,20 @@ watch(
     updateGatherCurtain()
     updateFeaturePickMarker()
     updateCloud()
+    updateReservoir()
+  },
+)
+
+watch(
+  [
+    () => store.showReservoir,
+    () => store.reservoirEnvelope,
+    () => store.interpretedHorizons,
+    () => store.visibleWellPicks,
+    () => store.reservoirOpacity,
+  ],
+  () => {
+    updateReservoir()
   },
 )
 
@@ -760,6 +861,21 @@ watch(showBox, (v) => {
           @click="showGatherCurtain = !showGatherCurtain"
         >
           Gather Curtain
+        </button>
+
+        <button
+          v-if="store.hasHorizons"
+          type="button"
+          class="px-2 py-0.5 rounded text-[11px] border transition-colors"
+          :class="
+            store.showReservoir
+              ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+              : 'bg-slate-950 border-slate-800 text-slate-400'
+          "
+          title="Show the Volve Hugin reservoir model and interpreted horizons (ground truth)"
+          @click="store.toggleReservoir()"
+        >
+          Reservoir
         </button>
 
         <button

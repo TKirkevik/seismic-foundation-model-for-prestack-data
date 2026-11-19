@@ -3,10 +3,11 @@ backend/.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-data/
+data/*
 weights/
 embeddings/*.npz
 node_modules/
 frontend/node_modules/
 frontend/dist/
 figures/
+!data/ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time_horizons.npz
