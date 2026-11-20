@@ -106,7 +106,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const offsetIndex = ref(0)
 
   // Display settings
-  const seismicColormap = ref<SeismicColormapId>('rwb')
+  const seismicColormap = ref<SeismicColormapId>('grayscale')
   const overlayColormap = ref<OverlayColormapId>('inferno')
   const globalGain = ref(1.0)
   const overlayInterp = ref<'smooth' | 'patch'>('smooth')
