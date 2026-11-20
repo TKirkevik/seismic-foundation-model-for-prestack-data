@@ -17,14 +17,17 @@ if str(BACKEND_DIR) not in sys.path:
 
 from .config import Settings, settings as default_settings  # noqa: E402
 from .device import get_device_info  # noqa: E402
-from .jobs import JobManager  # noqa: E402
+from .horizon_store import HorizonStore  # noqa: E402
+from .jobs import JobConflictError, JobManager  # noqa: E402
 from .latent_store import LatentStore  # noqa: E402
 from .models import (  # noqa: E402
     AttributeResponse,
     DemoEmbeddingsJobRequest,
     EmbedJobRequest,
     EmbeddingSetSummary,
+    FocusTrajectoryResponse,
     HealthResponse,
+    HorizonsResponse,
     JobStatus,
     PreprocessJobRequest,
     SimilarityRequest,
@@ -40,11 +43,13 @@ class AppState:
         self.settings = cfg
         self.seismic_store = SeismicStore(cfg.data_dir, pool_size=cfg.sgz_pool_size)
         self.latent_store = LatentStore(cfg.data_dir, cfg.embeddings_dir)
+        self.horizon_store = HorizonStore(cfg.data_dir)
         self.job_manager = JobManager(cfg, self.seismic_store, self.latent_store, self.rescan)
 
     def rescan(self) -> list[SurveySummary]:
         surveys = self.seismic_store.scan()
         self.latent_store.scan(list(surveys.keys()))
+        self.horizon_store.scan(list(surveys.keys()))
         return self.list_surveys()
 
     def list_surveys(self) -> list[SurveySummary]:
@@ -84,6 +89,7 @@ class AppState:
                     default_offset_index=s.default_offset_index,
                     amplitude_clip_default=s.amplitude_clip_default,
                     embedding_sets=emb_sets,
+                    horizon_ids=self.horizon_store.horizon_ids(s.survey_id),
                 )
             )
         return result
@@ -213,12 +219,40 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 offset_idx=body.offset_idx,
                 mode=body.mode,
                 whiten=body.whiten,
+                features=body.features,
+                exclusion_weight=body.exclusion_weight,
+                focus_pick=body.focus_pick,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (IndexError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return SimilarityResponse(**res)
+
+    @app.get("/api/surveys/{survey_id}/trajectory", response_model=FocusTrajectoryResponse)
+    def get_trajectory(
+        survey_id: str,
+        embedding_set_id: str = Query(...),
+        il_idx: int = Query(..., ge=0),
+        xl_idx: int = Query(..., ge=0),
+        sample_idx: int = Query(..., ge=0),
+        offset_idx: int = Query(0, ge=0),
+    ) -> FocusTrajectoryResponse:
+        try:
+            survey = state.seismic_store.get_survey(survey_id)
+            res = state.latent_store.compute_trajectory(
+                survey=survey,
+                embedding_set_id=embedding_set_id,
+                il_idx=il_idx,
+                xl_idx=xl_idx,
+                sample_idx=sample_idx,
+                offset_idx=offset_idx,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (IndexError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return FocusTrajectoryResponse(**res)
 
     @app.get("/api/surveys/{survey_id}/attribute", response_model=AttributeResponse)
     def get_attribute(
@@ -239,6 +273,17 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return AttributeResponse(**res)
 
+    @app.get("/api/surveys/{survey_id}/horizons", response_model=HorizonsResponse)
+    def get_horizons(survey_id: str) -> HorizonsResponse:
+        try:
+            survey = state.seismic_store.get_survey(survey_id)
+            payload = state.horizon_store.get_payload(survey_id, survey.shape)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return HorizonsResponse(**payload)
+
     @app.get("/api/jobs", response_model=list[JobStatus])
     def list_jobs() -> list[JobStatus]:
         return state.job_manager.list_jobs()
@@ -251,6 +296,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 tag=body.tag,
                 offset_stride=body.offset_stride,
             )
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, FileNotFoundError) as exc:
@@ -267,6 +314,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 batch_size=body.batch_size,
                 auto_summarize=body.auto_summarize,
             )
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, FileNotFoundError) as exc:
@@ -280,6 +329,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 tag=body.tag,
                 exclude_zero_offset=body.exclude_zero_offset,
             )
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, FileNotFoundError) as exc:
@@ -292,6 +343,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 survey_id=body.survey_id,
                 params=body.params,
             )
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, FileNotFoundError) as exc:

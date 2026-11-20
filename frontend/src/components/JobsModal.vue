@@ -8,7 +8,7 @@ const store = useWorkbenchStore()
 
 const offsetsSlice = ref('0:100:10')
 const numOverlapPatches = ref(0)
-const batchSize = ref(8)
+const batchSize = ref(store.health?.device === 'mps' ? 2 : 4)
 const autoSummarize = ref(true)
 const excludeZeroOffset = ref(false)
 const summarizeSetId = ref('ncs3d')
@@ -18,20 +18,23 @@ const launching = ref(false)
 const survey = computed(() => store.activeSurvey)
 const embeddingSets = computed(() => survey.value?.embedding_sets ?? [])
 
+const JOB_TYPE_TITLES: Record<string, string> = {
+  embed_patches: 'NCS-3D Patch Embedder',
+  summarize_offsets: 'Offset Trajectory Summarizer',
+  generate_demo_embeddings: 'Fast Demo Embeddings',
+  preprocess: 'Survey Preprocessor',
+}
+
 function jobTitle(job: JobInfo): string {
-  return job.title || job.type || job.kind || job.id
+  return JOB_TYPE_TITLES[job.job_type] ?? (job.job_type || job.id)
 }
 
 function jobProgressPct(job: JobInfo): number {
-  const p = job.progress ?? 0
-  if (p <= 1 && p > 0) return Math.round(p * 100)
-  return Math.max(0, Math.min(100, Math.round(p)))
+  return Math.max(0, Math.min(100, Math.round(job.progress_pct ?? 0)))
 }
 
 function jobLogsText(job: JobInfo): string {
-  if (job.log_tail) return job.log_tail
-  if (job.logs && job.logs.length > 0) return job.logs.slice(-14).join('\n')
-  return ''
+  return job.logs_tail?.slice(-14).join('\n') ?? ''
 }
 
 function statusBadgeClass(status: string): string {
@@ -47,7 +50,7 @@ async function runDemo() {
   launching.value = true
   launchError.value = null
   try {
-    await store.launchDemoJob({ survey_id: survey.value.id })
+    await store.launchDemoJob({ survey_id: survey.value.id, tag: 'demo' })
   } catch (err) {
     launchError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -62,7 +65,8 @@ async function runEmbed() {
   try {
     await store.launchEmbedJob({
       survey_id: survey.value.id,
-      offsets: offsetsSlice.value.trim() || undefined,
+      tag: 'ncs3d',
+      offsets: offsetsSlice.value.trim() || null,
       num_overlap_patches: numOverlapPatches.value,
       batch_size: batchSize.value,
       auto_summarize: autoSummarize.value,
@@ -81,7 +85,7 @@ async function runSummarize() {
   try {
     await store.launchSummarizeJob({
       survey_id: survey.value.id,
-      embedding_set_id: summarizeSetId.value || store.activeEmbeddingSetId || undefined,
+      tag: summarizeSetId.value || store.activeEmbeddingSetId || undefined,
       exclude_zero_offset: excludeZeroOffset.value,
     })
   } catch (err) {
@@ -203,7 +207,7 @@ onMounted(() => {
                       <button
                         type="button"
                         class="px-1.5 py-0.2 rounded bg-slate-950 border border-slate-800 text-[10px] text-slate-300 hover:border-cyan-500/40"
-                        @click="offsetsSlice = '0:100:1'"
+                        @click="offsetsSlice = ''"
                       >
                         Full
                       </button>
@@ -212,7 +216,7 @@ onMounted(() => {
                   <input
                     v-model="offsetsSlice"
                     type="text"
-                    placeholder="0:100:10"
+                    placeholder="All offsets (or e.g. 0:100:10)"
                     class="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 font-mono-num text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
                   />
                 </div>
@@ -370,10 +374,12 @@ onMounted(() => {
                 />
               </div>
 
-              <div v-if="job.stage || job.message || job.error" class="text-[11px]">
-                <span v-if="job.stage" class="text-cyan-300 mr-1.5">[{{ job.stage }}]</span>
-                <span v-if="job.message" class="text-slate-300">{{ job.message }}</span>
-                <span v-if="job.error" class="text-rose-300 block mt-1">{{ job.error }}</span>
+              <div
+                v-if="job.message"
+                class="text-[11px]"
+                :class="job.status === 'failed' ? 'text-rose-300' : 'text-slate-300'"
+              >
+                {{ job.message }}
               </div>
 
               <pre

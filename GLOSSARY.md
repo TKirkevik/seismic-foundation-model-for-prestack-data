@@ -15,8 +15,8 @@ A single 3D seismic volume `(Inline, Crossline, Sample)` extracted at one discre
 _Avoid_: Stack, sub-cube, partial volume
 
 **Section**:
-A 2D slice through a single Offset Cube along a constant Inline, Crossline, or Sample plane.
-_Avoid_: Profile, cut, slice view
+A 2D slice through a single Common-Offset Volume along a constant Inline, Crossline, or Sample plane.
+_Avoid_: Profile, cut, slice view, offset cube
 
 **Gather**:
 A 2D pre-stack slice `(Offset, Sample)` at a single `(Inline, Crossline)` coordinate showing amplitude variation across offsets.
@@ -40,10 +40,32 @@ _Avoid_: Feature map, vector store, latent cube
 The path a single spatial Patch traces through latent space across offsets, summarized by its zero-offset anchor, primary offset direction (linear trend with `|offset|`), and offset curvature (leading nonlinear residual axis).
 _Avoid_: AVO curve, offset path, latent drift
 
-**Feature Pick**:
-A user-selected `(Inline, Crossline, Sample)` coordinate (with optional offset scope) used as the query anchor in latent space.
-_Avoid_: Seed, marker, click point, label
+**Pick**:
+A single interpreted `(Inline, Crossline, Sample)` coordinate on a vertical Section, optionally scoped to an offset.
+_Avoid_: Seed, marker, click point, vertex
+
+**Picked Feature**:
+A subsurface target or counter-example defined on an Inline or Crossline Section by either a single Pick or a coplanar set of Picks—as discrete points, a linearly interpolated polyline, or a closed polygon—carrying an Inclusion or Exclusion role.
+_Avoid_: ROI, mask, annotation, label, feature pick
+
+**Similarity Query**:
+A composite latent-space search combining active Inclusion and Exclusion Picked Features to highlight analogous subsurface structure while suppressing unwanted matches.
+_Avoid_: Prompt, filter set, search expression
 
 **Similarity Volume**:
-A 3D scalar field over the Survey grid quantifying latent-space similarity between every Patch and a Feature Pick—evaluated at a selected offset, at zero-offset, or along the Offset Trajectory (`offset_direction` / `offset_curvature`).
+A 3D scalar field over the Survey grid quantifying latent-space affinity between every Patch and a Similarity Query—evaluated at a selected offset, at zero-offset, or along the Offset Trajectory (`offset_direction` / `offset_curvature`).
 _Avoid_: Heatmap cube, correlation volume, distance map
+
+### Ground Truth
+
+**Horizon**:
+A `(Inline, Crossline)` grid of two-way time (ms) for one geological surface, `NaN` where undefined. Served per Survey from `<survey>_horizons.npz` with a `kind` of `horizon` (interpreted), `top` or `base` (the two bounding surfaces of the Reservoir Envelope).
+_Avoid_: Surface map, pick grid, marker
+
+**Reservoir Envelope**:
+The interval between the `top` and `base` Horizons of the Volve Eclipse reservoir model (Hugin Fm.), converted from depth to PP time by tying the top to the interpreted Top Hugin horizon and the base to the well-derived Hugin interval velocity. Toggled as one layer across every viewer.
+_Avoid_: Answer key, truth mask, reservoir body
+
+**Well Pick**:
+A formation top observed in a wellbore (`well`, `formation`, TVDSS, TWT) placed at its own `(Inline, Crossline)` bin; drawn as a marker when the current Section or Time Slice passes near it.
+_Avoid_: Well top, marker, formation marker
