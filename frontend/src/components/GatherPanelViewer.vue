@@ -4,6 +4,7 @@ import { Crosshair, RefreshCw, RotateCcw } from 'lucide-vue-next'
 import { useWorkbenchStore } from '../stores/workbench'
 import { getOverlayLUT, getSeismicLUT } from '../utils/colormaps'
 import { buildAxisLookup } from '../utils/interpolation'
+import { envelopeAt, hexToRgba } from '../utils/reservoir'
 
 const store = useWorkbenchStore()
 const containerRef = ref<HTMLDivElement | null>(null)
@@ -283,6 +284,48 @@ function renderCanvas() {
         }
         ctx.stroke()
       }
+      ctx.restore()
+    }
+
+    // Ground-truth reservoir interval at this gather location
+    const gLoc = dataObj.locations[g]
+    const env = store.reservoirEnvelope
+    if (env && gLoc) {
+      const at = envelopeAt(env, s.shape[1], gLoc.il_idx, gLoc.xl_idx)
+      if (at) {
+        const yTop = startY + ((store.twtToSample(at.top) + 0.5) / nSamples) * totalContentH
+        const yBase = startY + ((store.twtToSample(at.base) + 0.5) / nSamples) * totalContentH
+        ctx.save()
+        ctx.fillStyle = hexToRgba(env.color, store.reservoirOpacity)
+        ctx.fillRect(gx, yTop, gatherW, Math.max(1, yBase - yTop))
+        ctx.strokeStyle = hexToRgba(env.color, Math.min(1, store.reservoirOpacity + 0.5))
+        ctx.lineWidth = 1.5
+        ctx.beginPath()
+        ctx.moveTo(gx, yTop)
+        ctx.lineTo(gx + gatherW, yTop)
+        ctx.stroke()
+        ctx.lineWidth = 1
+        ctx.setLineDash([5, 3])
+        ctx.beginPath()
+        ctx.moveTo(gx, yBase)
+        ctx.lineTo(gx + gatherW, yBase)
+        ctx.stroke()
+        ctx.restore()
+      }
+    }
+    for (const hz of store.interpretedHorizons) {
+      if (!gLoc) break
+      const v = hz.twt[gLoc.il_idx * s.shape[1] + gLoc.xl_idx]
+      if (!Number.isFinite(v)) continue
+      const y = startY + ((store.twtToSample(v) + 0.5) / nSamples) * totalContentH
+      ctx.save()
+      ctx.strokeStyle = hexToRgba(hz.color, 0.95)
+      ctx.lineWidth = 1.25
+      ctx.setLineDash([2, 3])
+      ctx.beginPath()
+      ctx.moveTo(gx, y)
+      ctx.lineTo(gx + gatherW, y)
+      ctx.stroke()
       ctx.restore()
     }
 
@@ -663,6 +706,9 @@ watch(
     () => store.focusPick,
     () => store.gatherWiggle,
     () => store.gatherHighlightActiveOffset,
+    () => store.reservoirEnvelope,
+    () => store.interpretedHorizons,
+    () => store.reservoirOpacity,
   ],
   () => {
     scheduleRender()

@@ -38,6 +38,38 @@ export interface SurveySummary {
   default_offset_index: number
   amplitude_clip_default: number
   embedding_sets: EmbeddingSetInfo[]
+  horizon_ids: string[]
+}
+
+export type HorizonKind = 'horizon' | 'top' | 'base'
+
+export interface HorizonSurfaceInfo {
+  id: string
+  label: string
+  kind: HorizonKind
+  color: string
+  grid_shape: [number, number] // [n_il, n_xl]
+  twt_min: number
+  twt_max: number
+  coverage: number
+  twt_b64: string
+}
+
+export interface WellPick {
+  well: string
+  formation: string
+  il_idx: number
+  xl_idx: number
+  twt: number
+  tvdss: number
+  qualifier: string
+}
+
+export interface HorizonsResponse {
+  survey_id: string
+  horizons: HorizonSurfaceInfo[]
+  well_picks: WellPick[]
+  meta: Record<string, unknown>
 }
 
 export type SectionAxis = 'inline' | 'xline' | 'sample'

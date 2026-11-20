@@ -8,6 +8,7 @@ import {
   fetchFocusTrajectory,
   fetchGatherPanel,
   fetchHealth,
+  fetchHorizons,
   fetchJobs,
   fetchSection,
   fetchSimilarity,
@@ -30,6 +31,7 @@ import type {
   GatherLineAxis,
   GatherPanelResponseData,
   HealthStatus,
+  HorizonKind,
   JobInfo,
   LayoutMode,
   OverlayColormapId,
@@ -44,6 +46,7 @@ import type {
   SummarizeJobRequest,
   SurveySummary,
   ViewerType,
+  WellPick,
 } from '../api/types'
 
 export interface ActiveOverlayVolume {
@@ -58,6 +61,24 @@ export interface ActiveOverlayVolume {
   min: number
   max: number
   threshold: number
+}
+
+export interface HorizonGrid {
+  id: string
+  label: string
+  kind: HorizonKind
+  color: string
+  twt: Float32Array // (n_il, n_xl) ms, NaN where undefined
+  twtMin: number
+  twtMax: number
+  coverage: number
+}
+
+export interface ReservoirEnvelope {
+  label: string
+  color: string
+  top: Float32Array
+  base: Float32Array
 }
 
 const MAX_SECTION_CACHE = 48
@@ -162,6 +183,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const attributeVolume = ref<Float32Array | null>(null)
   const attributeLoading = ref(false)
 
+  // Ground truth (interpreted horizons + reservoir model converted to time)
+  const horizons = ref<HorizonGrid[]>([])
+  const wellPicks = ref<WellPick[]>([])
+  const horizonsMeta = ref<Record<string, unknown>>({})
+  const horizonsLoading = ref(false)
+  const showReservoir = ref(false)
+  const reservoirShowModel = ref(true)
+  const reservoirShowHorizons = ref(true)
+  const reservoirShowWells = ref(true)
+  const reservoirOpacity = ref(0.35)
+
   // Jobs orchestrator
   const jobs = ref<JobInfo[]>([])
   const jobsLoading = ref(false)
@@ -244,6 +276,37 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const hasActiveJobs = computed(() =>
     jobs.value.some((j) => j.status === 'queued' || j.status === 'running'),
   )
+
+  const hasHorizons = computed(() => (activeSurvey.value?.horizon_ids.length ?? 0) > 0)
+
+  const sampleOrigin = computed(() => activeSurvey.value?.samples[0] ?? 0)
+  const sampleRate = computed(() => {
+    const s = activeSurvey.value?.samples
+    return s && s.length > 1 ? s[1] - s[0] : 1
+  })
+
+  /** Fractional sample index of a two-way time in ms. */
+  function twtToSample(twt: number): number {
+    return (twt - sampleOrigin.value) / sampleRate.value
+  }
+
+  const reservoirEnvelope = computed<ReservoirEnvelope | null>(() => {
+    if (!showReservoir.value || !reservoirShowModel.value) return null
+    const top = horizons.value.find((h) => h.kind === 'top')
+    const base = horizons.value.find((h) => h.kind === 'base')
+    if (!top || !base) return null
+    return { label: top.label, color: top.color, top: top.twt, base: base.twt }
+  })
+
+  const interpretedHorizons = computed<HorizonGrid[]>(() => {
+    if (!showReservoir.value || !reservoirShowHorizons.value) return []
+    return horizons.value.filter((h) => h.kind === 'horizon')
+  })
+
+  const visibleWellPicks = computed<WellPick[]>(() => {
+    if (!showReservoir.value || !reservoirShowWells.value) return []
+    return wellPicks.value.filter((p) => p.formation.startsWith('Hugin'))
+  })
 
   const activeDrawingFeature = computed<PickedFeature | null>(() => {
     if (!activeDrawingFeatureId.value) return null
@@ -496,6 +559,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     similarityDirty.value = false
     attributeResult.value = null
     attributeVolume.value = null
+    horizons.value = []
+    wellPicks.value = []
+    horizonsMeta.value = {}
 
     const preferredSet =
       target.embedding_sets.find((e) => e.id === 'ncs3d') ?? target.embedding_sets[0] ?? null
@@ -516,6 +582,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
 
     void refreshActiveViews()
+    void loadHorizons()
   }
 
   async function initialize() {
@@ -557,6 +624,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
             match.embedding_sets[0] ??
             null
           applyEmbeddingSetDefaults(curSet)
+          if (match.horizon_ids.length !== horizons.value.length) void loadHorizons()
           if (
             overlaySource.value === 'attribute' &&
             (!curSet || curSet.available_attributes.length === 0)
@@ -1363,6 +1431,43 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
 
+  async function loadHorizons() {
+    const survey = activeSurvey.value
+    if (!survey || survey.horizon_ids.length === 0) {
+      horizons.value = []
+      wellPicks.value = []
+      horizonsMeta.value = {}
+      return
+    }
+    horizonsLoading.value = true
+    try {
+      const resp = await fetchHorizons(survey.id)
+      if (activeSurvey.value?.id !== survey.id) return
+      horizons.value = resp.horizons.map((h) => ({
+        id: h.id,
+        label: h.label,
+        kind: h.kind,
+        color: h.color,
+        twt: decodeFloat32Base64(h.twt_b64),
+        twtMin: h.twt_min,
+        twtMax: h.twt_max,
+        coverage: h.coverage,
+      }))
+      wellPicks.value = resp.well_picks
+      horizonsMeta.value = resp.meta
+    } catch (err) {
+      if (!isAbortError(err)) {
+        apiError.value = err instanceof Error ? err.message : String(err)
+      }
+    } finally {
+      horizonsLoading.value = false
+    }
+  }
+
+  function toggleReservoir(force?: boolean) {
+    showReservoir.value = force !== undefined ? force : !showReservoir.value
+  }
+
   function selectEmbeddingSet(setId: string) {
     const survey = activeSurvey.value
     if (!survey) return
@@ -1545,6 +1650,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     attributeResult,
     attributeVolume,
     attributeLoading,
+    horizons,
+    wellPicks,
+    horizonsMeta,
+    horizonsLoading,
+    showReservoir,
+    reservoirShowModel,
+    reservoirShowHorizons,
+    reservoirShowWells,
+    reservoirOpacity,
     jobs,
     jobsLoading,
 
@@ -1558,6 +1672,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     currentOffsetLabel,
     activeOverlay,
     hasActiveJobs,
+    hasHorizons,
+    sampleOrigin,
+    sampleRate,
+    reservoirEnvelope,
+    interpretedHorizons,
+    visibleWellPicks,
     activeDrawingFeature,
     enabledIncludeFeatures,
     enabledExcludeFeatures,
@@ -1592,6 +1712,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     refreshFocusTrajectory,
     runSimilarityQuery,
     loadAttribute,
+    loadHorizons,
+    toggleReservoir,
+    twtToSample,
     selectEmbeddingSet,
     setOverlaySource,
     setLayoutMode,

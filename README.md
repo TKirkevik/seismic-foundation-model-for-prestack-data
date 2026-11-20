@@ -17,6 +17,7 @@ latent space as a function of offset.
 | `visualization/plot_offset_summary.py` | Step 3 – PNG figures of the summary (`figures/`, not tracked) |
 | `backend/` | FastAPI + `uv` cross-platform (`CUDA` / Mac M4 `MPS`) server for `.sgz` slicing, GPU/MPS similarity search, and `embedders/` job orchestration |
 | `frontend/` | Vue 3 + TypeScript + Three.js workbench (Section Viewer, 3D Cube Viewer, Pre-Stack Gather Panel, Similarity & Offset Trajectory inspector) |
+| `backend/scripts/build_reservoir_horizons.py` | Volve ground truth: Top Hugin TWT horizon, well picks and the Eclipse reservoir grid converted to PP time → `data/<survey>_horizons.npz`, toggleable in the viewer |
 | `GLOSSARY.md` | Canonical domain glossary |
 
 Current dataset: `ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time.sgz` — 193 inlines × 303 crosslines ×

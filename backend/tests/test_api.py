@@ -219,6 +219,35 @@ def test_attribute_endpoint(client: TestClient, attribute: str):
     assert np.isclose(vals.max(), data["value_max"], atol=1e-5)
 
 
+def test_horizons_endpoint(client: TestClient):
+    surveys = client.get("/api/surveys").json()
+    survey = next(s for s in surveys if s["id"] == SURVEY_ID)
+    assert set(survey["horizon_ids"]) >= {"top_hugin_twt", "reservoir_top", "reservoir_base"}
+
+    resp = client.get(f"/api/surveys/{SURVEY_ID}/horizons")
+    assert resp.status_code == 200
+    data = resp.json()
+    by_id = {h["id"]: h for h in data["horizons"]}
+    top = by_id["reservoir_top"]
+    base = by_id["reservoir_base"]
+    assert top["kind"] == "top" and base["kind"] == "base"
+    assert top["grid_shape"] == [193, 303]
+
+    top_twt = np.frombuffer(base64.b64decode(top["twt_b64"]), dtype="<f4").reshape(193, 303)
+    base_twt = np.frombuffer(base64.b64decode(base["twt_b64"]), dtype="<f4").reshape(193, 303)
+    defined = np.isfinite(top_twt)
+    assert defined.any() and np.array_equal(defined, np.isfinite(base_twt))
+    assert (base_twt[defined] >= top_twt[defined]).all()
+    assert 2000.0 < top_twt[defined].min() < top_twt[defined].max() < 3500.0
+    assert np.isclose(top_twt[defined].min(), top["twt_min"], atol=1e-3)
+
+    picks = data["well_picks"]
+    assert picks and all(0 <= p["il_idx"] < 193 and 0 <= p["xl_idx"] < 303 for p in picks)
+
+    missing = client.get("/api/surveys/does-not-exist/horizons")
+    assert missing.status_code == 404
+
+
 def test_jobs_and_preprocess_stub(client: TestClient):
     resp = client.get("/api/jobs")
     assert resp.status_code == 200

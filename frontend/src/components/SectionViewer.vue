@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Crosshair, RotateCcw } from 'lucide-vue-next'
+import { Crosshair, Layers, RotateCcw } from 'lucide-vue-next'
 import type { FeatureGeometryMode, PickedFeature, SectionAxis } from '../api/types'
 import { useWorkbenchStore } from '../stores/workbench'
 import { getOverlayLUT, getSeismicLUT } from '../utils/colormaps'
@@ -14,6 +14,15 @@ import {
   type HandleCandidate,
 } from '../utils/featureGeometry'
 import { buildAxisLookup } from '../utils/interpolation'
+import {
+  drawEnvelopeSection,
+  drawHorizonSection,
+  drawWellPicksSection,
+  drawWellPicksTimeSlice,
+  envelopeAt,
+  paintTimeSliceImage,
+  type SectionLineContext,
+} from '../utils/reservoir'
 
 const props = withDefaults(
   defineProps<{
@@ -34,8 +43,10 @@ const canvasRef = ref<HTMLCanvasElement | null>(null)
 // Offscreen canvases for 1:1 rasterization
 const seismicOffscreen = document.createElement('canvas')
 const overlayOffscreen = document.createElement('canvas')
+const reservoirOffscreen = document.createElement('canvas')
 let hasSeismicImage = false
 let hasOverlayImage = false
+let hasReservoirImage = false
 
 // Zoom & pan state in plot-relative normalized/pixel space
 const zoom = ref(1.0)
@@ -73,6 +84,7 @@ const hoverInfo = ref<{
   sample: number
   amp: number
   sim: number | null
+  reservoir: string | null
 } | null>(null)
 
 const MARGIN_LEFT = 56
@@ -378,6 +390,80 @@ function rebuildOverlayTexture() {
   hasOverlayImage = true
 }
 
+// Time-slice reservoir mask: bins whose top <= t <= base, plus horizon outcrops near t.
+const HORIZON_SLICE_WINDOW_SAMPLES = 1.5
+
+function rebuildReservoirSliceTexture() {
+  hasReservoirImage = false
+  const s = survey.value
+  if (!s || axis.value !== 'sample' || !store.showReservoir) return
+  const [nIl, nXl] = s.shape
+  const twt = s.samples[store.sampleIdx] ?? 0
+  hasReservoirImage = paintTimeSliceImage(
+    reservoirOffscreen,
+    nIl,
+    nXl,
+    twt,
+    store.sampleRate * HORIZON_SLICE_WINDOW_SAMPLES,
+    store.reservoirEnvelope,
+    store.interpretedHorizons,
+  )
+}
+
+function drawReservoir(
+  ctx: CanvasRenderingContext2D,
+  toScreenX: (gx: number) => number,
+  toScreenY: (gy: number) => number,
+  drawX: number,
+  drawY: number,
+  drawW: number,
+  drawH: number,
+) {
+  const s = survey.value
+  if (!s || !store.showReservoir) return
+  const [nIl, nXl] = s.shape
+  if (axis.value === 'sample') {
+    if (hasReservoirImage) {
+      ctx.save()
+      ctx.globalAlpha = Math.min(1, store.reservoirOpacity + 0.25)
+      ctx.imageSmoothingEnabled = false
+      ctx.drawImage(reservoirOffscreen, drawX, drawY, drawW, drawH)
+      ctx.restore()
+    }
+    const twt = s.samples[store.sampleIdx] ?? 0
+    drawWellPicksTimeSlice(
+      {
+        ctx,
+        nIl,
+        nXl,
+        twt,
+        halfWindowMs: store.sampleRate * HORIZON_SLICE_WINDOW_SAMPLES,
+        toScreenX,
+        toScreenY,
+        opacity: store.reservoirOpacity,
+      },
+      store.visibleWellPicks,
+      40,
+    )
+    return
+  }
+  const c: SectionLineContext = {
+    ctx,
+    axis: axis.value,
+    fixedIdx: axis.value === 'inline' ? store.ilIdx : store.xlIdx,
+    nIl,
+    nXl,
+    twtToSample: store.twtToSample,
+    toScreenX,
+    toScreenY,
+    opacity: store.reservoirOpacity,
+  }
+  const env = store.reservoirEnvelope
+  if (env) drawEnvelopeSection(c, env)
+  for (const hz of store.interpretedHorizons) drawHorizonSection(c, hz)
+  drawWellPicksSection(c, store.visibleWellPicks)
+}
+
 function getViewportRect(cssW: number, cssH: number) {
   const plotX = MARGIN_LEFT
   const plotY = MARGIN_TOP
@@ -441,6 +527,9 @@ function renderCanvas() {
 
   const toScreenX = (gx: number) => drawX + ((gx + 0.5) / dataW) * drawW
   const toScreenY = (gy: number) => drawY + ((gy + 0.5) / dataH) * drawH
+
+  // Ground-truth reservoir / horizons / well picks
+  drawReservoir(ctx, toScreenX, toScreenY, drawX, drawY, drawW, drawH)
 
   // Gather panel location markers
   const gp = store.gatherPanelData
@@ -1211,12 +1300,23 @@ function updateHover(clientX: number, clientY: number) {
     sim = (c00 * (1 - wj) + c01 * wj) * (1 - wi) + (c10 * (1 - wj) + c11 * wj) * wi
   }
 
+  let reservoir: string | null = null
+  const env = store.reservoirEnvelope
+  if (env) {
+    const at = envelopeAt(env, s.shape[1], ilI, xlI)
+    if (at) {
+      const t = s.samples[sampI] ?? 0
+      reservoir = t >= at.top && t <= at.base ? 'in Hugin reservoir' : `Hugin ${at.top.toFixed(0)}–${at.base.toFixed(0)} ms`
+    }
+  }
+
   hoverInfo.value = {
     il: s.ilines[ilI] ?? ilI,
     xl: s.xlines[xlI] ?? xlI,
     sample: s.samples[sampI] ?? sampI,
     amp,
     sim,
+    reservoir,
   }
 }
 
@@ -1316,11 +1416,28 @@ watch(
     () => store.selectedFeatureId,
     () => store.hoveredPickRef,
     () => store.gatherPanelData,
+    () => store.reservoirOpacity,
+    () => store.visibleWellPicks,
   ],
   () => {
     scheduleRender()
   },
   { deep: true },
+)
+
+watch(
+  [
+    () => store.showReservoir,
+    () => store.reservoirEnvelope,
+    () => store.interpretedHorizons,
+    () => store.sampleIdx,
+    axis,
+  ],
+  () => {
+    rebuildReservoirSliceTexture()
+    scheduleRender()
+  },
+  { immediate: true },
 )
 </script>
 
@@ -1387,6 +1504,23 @@ watch(
       </div>
 
       <div class="flex items-center gap-1.5 ml-auto flex-wrap">
+        <!-- Ground-truth reservoir toggle -->
+        <button
+          v-if="store.hasHorizons"
+          type="button"
+          class="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium border transition-colors"
+          :class="
+            store.showReservoir
+              ? 'bg-emerald-500/15 border-emerald-500/50 text-emerald-300'
+              : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+          "
+          title="Show the Volve Hugin reservoir model and interpreted horizons (ground truth)"
+          @click="store.toggleReservoir()"
+        >
+          <Layers class="w-3 h-3" />
+          <span>Reservoir</span>
+        </button>
+
         <!-- Quick Geometry Mode & Role Pills (on vertical sections) -->
         <div
           v-if="axis !== 'sample'"
@@ -1527,6 +1661,17 @@ watch(
         <span v-if="hoverInfo.sim !== null">
           {{ store.overlaySource === 'attribute' ? 'Attr' : 'Sim' }}
           <b class="text-emerald-300">{{ hoverInfo.sim.toFixed(3) }}</b>
+        </span>
+        <span
+          v-if="hoverInfo.reservoir"
+          class="px-1 rounded"
+          :class="
+            hoverInfo.reservoir.startsWith('in ')
+              ? 'bg-emerald-500/25 text-emerald-200'
+              : 'text-emerald-300/80'
+          "
+        >
+          {{ hoverInfo.reservoir }}
         </span>
       </div>
 
