@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import { Box, Eye, Layers, RotateCcw } from 'lucide-vue-next'
+import { Box, Clock, Eye, Layers, RotateCcw } from 'lucide-vue-next'
 import type { FeaturePlaneAxis, SectionAxis, SectionResponseData } from '../api/types'
 import { useWorkbenchStore } from '../stores/workbench'
 import { getOverlayLUT, getSeismicLUT, sampleLUT } from '../utils/colormaps'
@@ -27,6 +27,9 @@ const store = useWorkbenchStore()
 const containerRef = ref<HTMLDivElement | null>(null)
 
 const showSlices = ref(true)
+// The time slice is loaded with the other sections but hidden until the user turns it on;
+// it starts off on every page load and survey change. "Slices" stays the master switch.
+const showTimeSlice = ref(false)
 const showCloud = ref(true)
 const showGatherCurtain = ref(true)
 const showBox = ref(true)
@@ -328,7 +331,7 @@ function rebuildSurveyGeometry() {
   })
   sampleMesh = new THREE.Mesh(new THREE.PlaneGeometry(sizeX, sizeZ), sampleMat)
   sampleMesh.rotation.x = -Math.PI / 2
-  sampleMesh.visible = showSlices.value
+  sampleMesh.visible = showSlices.value && showTimeSlice.value
   scene.add(sampleMesh)
 }
 
@@ -1493,6 +1496,7 @@ onBeforeUnmount(() => {
 watch(
   () => store.activeSurveyId,
   () => {
+    showTimeSlice.value = false
     rebuildSurveyGeometry()
     updateSlicePositions()
     updateGatherCurtain()
@@ -1565,10 +1569,10 @@ watch(
   },
 )
 
-watch(showSlices, (v) => {
-  if (inlineMesh) inlineMesh.visible = v
-  if (xlineMesh) xlineMesh.visible = v
-  if (sampleMesh) sampleMesh.visible = v
+watch([showSlices, showTimeSlice], ([slices, timeSlice]) => {
+  if (inlineMesh) inlineMesh.visible = slices
+  if (xlineMesh) xlineMesh.visible = slices
+  if (sampleMesh) sampleMesh.visible = slices && timeSlice
 })
 
 watch(showGatherCurtain, (v) => {
@@ -1599,6 +1603,23 @@ watch(showBox, (v) => {
         >
           <Layers class="w-3 h-3" />
           <span>Slices</span>
+        </button>
+
+        <button
+          type="button"
+          class="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] border transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          :class="
+            showTimeSlice
+              ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300'
+              : 'bg-slate-950 border-slate-800 text-slate-400'
+          "
+          :disabled="!showSlices"
+          :aria-pressed="showTimeSlice"
+          :title="showSlices ? 'Show or hide the time slice' : 'Turn on Slices to use the time slice'"
+          @click="showTimeSlice = !showTimeSlice"
+        >
+          <Clock class="w-3 h-3" />
+          <span>Time slice</span>
         </button>
 
         <button
