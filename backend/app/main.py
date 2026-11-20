@@ -24,6 +24,7 @@ from .models import (  # noqa: E402
     DemoEmbeddingsJobRequest,
     EmbedJobRequest,
     EmbeddingSetSummary,
+    FocusTrajectoryResponse,
     HealthResponse,
     JobStatus,
     PreprocessJobRequest,
@@ -213,12 +214,40 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 offset_idx=body.offset_idx,
                 mode=body.mode,
                 whiten=body.whiten,
+                features=body.features,
+                exclusion_weight=body.exclusion_weight,
+                focus_pick=body.focus_pick,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (IndexError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return SimilarityResponse(**res)
+
+    @app.get("/api/surveys/{survey_id}/trajectory", response_model=FocusTrajectoryResponse)
+    def get_trajectory(
+        survey_id: str,
+        embedding_set_id: str = Query(...),
+        il_idx: int = Query(..., ge=0),
+        xl_idx: int = Query(..., ge=0),
+        sample_idx: int = Query(..., ge=0),
+        offset_idx: int = Query(0, ge=0),
+    ) -> FocusTrajectoryResponse:
+        try:
+            survey = state.seismic_store.get_survey(survey_id)
+            res = state.latent_store.compute_trajectory(
+                survey=survey,
+                embedding_set_id=embedding_set_id,
+                il_idx=il_idx,
+                xl_idx=xl_idx,
+                sample_idx=sample_idx,
+                offset_idx=offset_idx,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (IndexError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return FocusTrajectoryResponse(**res)
 
     @app.get("/api/surveys/{survey_id}/attribute", response_model=AttributeResponse)
     def get_attribute(

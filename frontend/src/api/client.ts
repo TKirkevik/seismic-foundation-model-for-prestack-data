@@ -2,6 +2,7 @@ import type {
   AttributeResponse,
   DemoEmbeddingsRequest,
   EmbedJobRequest,
+  FocusTrajectoryResponse,
   GatherLineAxis,
   GatherLocation,
   GatherPanelResponseData,
@@ -193,6 +194,32 @@ export async function fetchSimilarity(
     signal,
   })
   return parseJsonOrThrow<SimilarityResponse>(res)
+}
+
+export async function fetchFocusTrajectory(
+  surveyId: string,
+  params: {
+    embedding_set_id: string
+    il_idx: number
+    xl_idx: number
+    sample_idx: number
+    offset_idx: number
+  },
+  slot = 'trajectory',
+): Promise<FocusTrajectoryResponse> {
+  const signal = getSlotSignal(slot)
+  const qs = new URLSearchParams({
+    embedding_set_id: params.embedding_set_id,
+    il_idx: String(params.il_idx),
+    xl_idx: String(params.xl_idx),
+    sample_idx: String(params.sample_idx),
+    offset_idx: String(params.offset_idx),
+  })
+  const res = await fetch(
+    `/api/surveys/${encodeURIComponent(surveyId)}/trajectory?${qs.toString()}`,
+    { signal },
+  )
+  return parseJsonOrThrow<FocusTrajectoryResponse>(res)
 }
 
 export async function fetchAttribute(

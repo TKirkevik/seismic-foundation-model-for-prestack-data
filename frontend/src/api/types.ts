@@ -64,6 +64,32 @@ export interface GatherPanelResponseData {
   data: Float32Array
 }
 
+export type FeaturePlaneAxis = 'inline' | 'xline'
+export type FeatureGeometryMode = 'single' | 'points' | 'polyline' | 'polygon'
+export type FeatureRole = 'include' | 'exclude'
+
+export interface PickCoord {
+  il_idx: number
+  xl_idx: number
+  sample_idx: number
+}
+
+export interface PickedFeaturePayload {
+  id: string
+  role: FeatureRole
+  plane_axis: FeaturePlaneAxis
+  plane_index: number
+  geometry_mode: FeatureGeometryMode
+  picks: PickCoord[]
+}
+
+export interface PickedFeature extends PickedFeaturePayload {
+  name: string
+  enabled: boolean
+  status: 'in_progress' | 'completed'
+  createdAt: number
+}
+
 export interface FeaturePick {
   il_idx: number
   xl_idx: number
@@ -73,12 +99,15 @@ export interface FeaturePick {
 
 export interface SimilarityRequest {
   embedding_set_id: string
-  il_idx: number
-  xl_idx: number
-  sample_idx: number
   offset_idx: number
   mode: string
   whiten: boolean
+  exclusion_weight?: number
+  features?: PickedFeaturePayload[]
+  focus_pick?: PickCoord | null
+  il_idx?: number
+  xl_idx?: number
+  sample_idx?: number
 }
 
 export interface SimilarityMatch {
@@ -123,6 +152,15 @@ export interface SimilarityResponse {
   similarity_max: number
   similarity_b64: string
   top_matches: SimilarityMatch[]
+  trajectory: TrajectoryData
+  exclusion_weight?: number
+  included_patch_count?: number
+  excluded_patch_count?: number
+  overlap_resolved_count?: number
+}
+
+export interface FocusTrajectoryResponse {
+  pick: SimilarityResponse['pick']
   trajectory: TrajectoryData
 }
 

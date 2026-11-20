@@ -185,4 +185,4 @@ npm install
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173` to explore **Common-Offset Volumes**, **Sections**, stepped **Gather Panels**, **3D Cube slices & Patch clouds**, single-pick **Latent Similarity** (`active_offset`, `zero_offset`, `offset_direction`, `offset_curvature`, `combined_trajectory`), **Offset Trajectory** `(c₁, c₂)` curves, and launch/monitor `embedders/` jobs from the UI.
+Open `http://127.0.0.1:5173` to explore **Common-Offset Volumes**, **Sections**, stepped **Gather Panels**, **3D Cube slices & Patch clouds**, single-pick and multi-pick **Picked Features** (`single`, `points`, `polyline`, `polygon` on Inline/Crossline Sections with **Inclusion (+)** and **Exclusion (−)** refinement across `active_offset`, `zero_offset`, `offset_direction`, `offset_curvature`, and `combined_trajectory`), **Offset Trajectory** `(c₁, c₂)` curves, and launch/monitor `embedders/` jobs from the UI.

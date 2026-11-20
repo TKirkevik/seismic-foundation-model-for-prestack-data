@@ -1,6 +1,17 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Cpu, Database, RefreshCw, Sparkles, Target } from 'lucide-vue-next'
+import {
+  Cpu,
+  Database,
+  Eye,
+  EyeOff,
+  Plus,
+  RefreshCw,
+  Sparkles,
+  Target,
+  Trash2,
+} from 'lucide-vue-next'
+import type { FeatureGeometryMode, PickedFeature } from '../api/types'
 import { useWorkbenchStore } from '../stores/workbench'
 import { colormapGradientCss, getOverlayLUT } from '../utils/colormaps'
 import TrajectoryCard from './TrajectoryCard.vue'
@@ -85,15 +96,35 @@ function onEmbeddingSetChange(e: Event) {
 }
 
 function onModeChange() {
-  if (store.featurePick && store.overlaySource === 'similarity') {
-    void store.runSimilarityQuery()
-  }
+  store.onSimilarityParamsChanged()
 }
 
 function onWhitenChange() {
-  if (store.featurePick && store.overlaySource === 'similarity') {
-    void store.runSimilarityQuery()
+  store.onSimilarityParamsChanged()
+}
+
+const GEOM_MODES: Array<{ id: FeatureGeometryMode; label: string }> = [
+  { id: 'single', label: 'Single' },
+  { id: 'points', label: 'Points' },
+  { id: 'polyline', label: 'Polyline' },
+  { id: 'polygon', label: 'Polygon' },
+]
+
+function formatPlaneBadge(feat: PickedFeature): string {
+  const s = survey.value
+  if (feat.plane_axis === 'inline') {
+    const val = s?.ilines[feat.plane_index] ?? feat.plane_index
+    return `IL ${val}`
   }
+  const val = s?.xlines[feat.plane_index] ?? feat.plane_index
+  return `XL ${val}`
+}
+
+function formatGeomLabel(mode: FeatureGeometryMode): string {
+  if (mode === 'single') return 'Single'
+  if (mode === 'points') return 'Points'
+  if (mode === 'polyline') return 'Polyline'
+  return 'Polygon'
 }
 
 function onAttributeChange() {
@@ -378,7 +409,7 @@ function jumpToMatch(ilIdx: number, xlIdx: number, sampleIdx: number) {
               <input
                 v-model.number="store.similarityThreshold"
                 type="range"
-                min="0"
+                min="-0.5"
                 max="0.99"
                 step="0.01"
                 class="ws-slider w-full"
@@ -402,22 +433,238 @@ function jumpToMatch(ilIdx: number, xlIdx: number, sampleIdx: number) {
               />
             </div>
 
-            <!-- Active Feature Pick Status -->
-            <div class="pt-1 border-t border-slate-800/80 text-[10px]">
-              <div v-if="store.featurePick" class="flex items-center justify-between text-slate-300">
-                <span class="flex items-center gap-1 text-cyan-300">
-                  <Target class="w-3 h-3" />
-                  Feature Pick
-                </span>
-                <span class="font-mono-num">
-                  IL {{ survey.ilines[store.featurePick.il_idx] ?? store.featurePick.il_idx }} ·
-                  XL {{ survey.xlines[store.featurePick.xl_idx] ?? store.featurePick.xl_idx }} ·
-                  {{ survey.samples[store.featurePick.sample_idx] ?? store.featurePick.sample_idx }}ms
+            <!-- Guard & Threshold Notices -->
+            <div
+              v-if="store.hasOnlyExcludeFeatures"
+              class="rounded bg-amber-950/60 border border-amber-500/40 px-2 py-1.5 text-[10px] text-amber-200"
+            >
+              Enable or add at least one Inclusion (+) feature to compute similarity.
+            </div>
+            <div
+              v-else-if="
+                store.similarityResult &&
+                store.similarityResult.similarity_max < store.similarityThreshold
+              "
+              class="rounded bg-amber-950/60 border border-amber-500/40 px-2 py-1.5 text-[10px] text-amber-200"
+            >
+              Max similarity ({{ store.similarityResult.similarity_max.toFixed(2) }}) is below
+              threshold ({{ store.similarityThreshold.toFixed(2) }}) — lower threshold to view.
+            </div>
+          </div>
+
+          <!-- Feature Picking & Refinement Panel -->
+          <div class="rounded border border-slate-800/90 bg-slate-900/50 p-2 space-y-2 text-[11px]">
+            <div class="flex items-center justify-between">
+              <span class="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-slate-300">
+                <Target class="w-3 h-3 text-cyan-400" />
+                <span>Feature Picking &amp; Refinement</span>
+              </span>
+              <button
+                v-if="store.activeGeometryMode === 'single'"
+                type="button"
+                class="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] bg-slate-950 border border-slate-800 text-cyan-300 hover:border-cyan-500/50 transition-colors"
+                title="Start a new Single pick instead of replacing the selected one"
+                @click="store.startNewFeatureSlot()"
+              >
+                <Plus class="w-2.5 h-2.5" />
+                <span>New</span>
+              </button>
+            </div>
+
+            <!-- Geometry Mode segmented buttons -->
+            <div class="grid grid-cols-4 rounded bg-slate-950 border border-slate-800 p-0.5 text-[10px]">
+              <button
+                v-for="gm in GEOM_MODES"
+                :key="gm.id"
+                type="button"
+                class="py-1 rounded font-medium transition-colors"
+                :class="
+                  store.activeGeometryMode === gm.id
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                "
+                @click="store.setGeometryMode(gm.id)"
+              >
+                {{ gm.label }}
+              </button>
+            </div>
+
+            <!-- Role segmented toggle -->
+            <div class="grid grid-cols-2 rounded bg-slate-950 border border-slate-800 p-0.5 text-[10px]">
+              <button
+                type="button"
+                class="py-1 rounded font-medium transition-colors"
+                :class="
+                  store.activeFeatureRole === 'include'
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                "
+                @click="store.setFeatureRole('include')"
+              >
+                Include (+)
+              </button>
+              <button
+                type="button"
+                class="py-1 rounded font-medium transition-colors"
+                :class="
+                  store.activeFeatureRole === 'exclude'
+                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                "
+                @click="store.setFeatureRole('exclude')"
+              >
+                Exclude (−)
+              </button>
+            </div>
+
+            <!-- Active drawing banner -->
+            <div
+              v-if="store.activeDrawingFeature"
+              class="flex items-center justify-between gap-2 rounded bg-amber-500/15 border border-amber-500/40 px-2 py-1 text-[10px] text-amber-200"
+            >
+              <span class="truncate">
+                Drawing {{ formatGeomLabel(store.activeDrawingFeature.geometry_mode) }} on
+                {{ formatPlaneBadge(store.activeDrawingFeature) }} ({{
+                  store.activeDrawingFeature.picks.length
+                }}
+                picks) — Double-click or Finish
+              </span>
+              <button
+                type="button"
+                class="shrink-0 px-1.5 py-0.5 rounded bg-amber-500/30 hover:bg-amber-500/50 text-amber-100 font-semibold"
+                @click="store.finishActiveDrawing()"
+              >
+                Finish
+              </button>
+            </div>
+
+            <!-- Exclusion Weight (alpha) -->
+            <div class="space-y-1 pt-0.5">
+              <div class="flex items-center justify-between text-[10px]">
+                <span class="text-slate-400">Exclusion Weight (α)</span>
+                <span class="font-mono-num text-rose-300">
+                  {{ store.exclusionWeight.toFixed(2) }}
                 </span>
               </div>
-              <div v-else class="text-slate-500">
-                Click on any Section or Gather to set a Feature Pick.
+              <input
+                :value="store.exclusionWeight"
+                type="range"
+                min="0"
+                max="2"
+                step="0.05"
+                class="ws-slider w-full"
+                @input="store.setExclusionWeight(Number(($event.target as HTMLInputElement).value))"
+              />
+              <div
+                v-if="
+                  store.similarityResult &&
+                  store.similarityResult.included_patch_count !== undefined
+                "
+                class="font-mono-num text-[9px] text-slate-400 flex items-center justify-between"
+              >
+                <span>
+                  {{ store.similarityResult.included_patch_count }} included ·
+                  {{ store.similarityResult.excluded_patch_count ?? 0 }} excluded patches
+                </span>
+                <span v-if="store.similarityResult.overlap_resolved_count">
+                  {{ store.similarityResult.overlap_resolved_count }} overlap
+                </span>
               </div>
+            </div>
+
+            <!-- Picked Features List -->
+            <div class="space-y-1 pt-1 border-t border-slate-800/80">
+              <div class="flex items-center justify-between text-[10px]">
+                <span class="text-slate-400">
+                  Picked Features ({{ store.pickedFeatures.length }})
+                </span>
+                <button
+                  v-if="store.pickedFeatures.length > 0"
+                  type="button"
+                  class="text-slate-500 hover:text-rose-300 transition-colors"
+                  @click="store.clearAllFeatures()"
+                >
+                  Clear All
+                </button>
+              </div>
+
+              <div
+                v-if="store.pickedFeatures.length > 0"
+                class="max-h-40 overflow-y-auto space-y-1 pr-0.5"
+              >
+                <div
+                  v-for="feat in store.pickedFeatures"
+                  :key="feat.id"
+                  class="flex items-center gap-1.5 px-1.5 py-1 rounded border text-[10px] transition-colors"
+                  :class="
+                    store.selectedFeatureId === feat.id
+                      ? 'bg-slate-900 border-cyan-500/50'
+                      : 'bg-slate-950/70 border-slate-800/80 hover:border-slate-700'
+                  "
+                >
+                  <!-- Role flip pill -->
+                  <button
+                    type="button"
+                    class="w-5 h-5 rounded font-bold flex items-center justify-center shrink-0 border transition-colors"
+                    :class="
+                      feat.role === 'include'
+                        ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/30'
+                        : 'bg-rose-500/20 border-rose-500/40 text-rose-300 hover:bg-rose-500/30'
+                    "
+                    title="Click to flip Include / Exclude"
+                    @click.stop="store.toggleFeatureRole(feat.id)"
+                  >
+                    {{ feat.role === 'include' ? '+' : '−' }}
+                  </button>
+
+                  <!-- Row jump button -->
+                  <button
+                    type="button"
+                    class="flex-1 min-w-0 text-left flex items-center justify-between gap-1"
+                    :class="feat.enabled ? 'text-slate-200' : 'text-slate-500 line-through'"
+                    @click="store.jumpToFeature(feat.id)"
+                  >
+                    <span class="truncate font-medium">
+                      {{ formatGeomLabel(feat.geometry_mode) }}
+                      <span class="text-slate-500 font-mono-num">
+                        · {{ feat.picks.length }}p
+                      </span>
+                    </span>
+                    <span class="font-mono-num text-[9px] px-1 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300 shrink-0">
+                      {{ formatPlaneBadge(feat) }}
+                    </span>
+                  </button>
+
+                  <!-- Enable / Mute -->
+                  <button
+                    type="button"
+                    class="p-0.5 rounded text-slate-400 hover:text-slate-100 shrink-0"
+                    :title="feat.enabled ? 'Mute feature' : 'Enable feature'"
+                    @click.stop="store.toggleFeatureEnabled(feat.id)"
+                  >
+                    <Eye v-if="feat.enabled" class="w-3 h-3" />
+                    <EyeOff v-else class="w-3 h-3 text-slate-600" />
+                  </button>
+
+                  <!-- Delete -->
+                  <button
+                    type="button"
+                    class="p-0.5 rounded text-slate-500 hover:text-rose-400 shrink-0"
+                    title="Delete feature"
+                    @click.stop="store.deleteFeature(feat.id)"
+                  >
+                    <Trash2 class="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
+              <div v-else class="text-[10px] text-slate-500 py-1">
+                No features picked yet.
+              </div>
+            </div>
+
+            <div class="text-[9px] text-slate-500 leading-relaxed pt-0.5 border-t border-slate-800/60">
+              Click IL/XL plane to pick · Double-click to close · Drag handle to move ·
+              Middle-click handle to delete · Click line to insert
             </div>
           </div>
 
@@ -484,7 +731,7 @@ function jumpToMatch(ilIdx: number, xlIdx: number, sampleIdx: number) {
               :style="{ background: overlayGradient }"
             />
             <div class="flex items-center justify-between font-mono-num text-[9px] text-slate-400">
-              <span>{{ store.activeOverlay.threshold.toPrecision(3) }}</span>
+              <span>{{ Math.min(store.activeOverlay.threshold, store.activeOverlay.max).toPrecision(3) }}</span>
               <span class="text-slate-500">{{ store.activeOverlay.label }}</span>
               <span>{{ store.activeOverlay.max.toPrecision(3) }}</span>
             </div>
