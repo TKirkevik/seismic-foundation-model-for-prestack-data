@@ -125,7 +125,7 @@ needed, because the tiling and blending are re-implemented in the embedder.
 | Hardware | Workbench backend | Pipeline scripts |
 |---|---|---|
 | NVIDIA GPU | CUDA, chosen automatically | CUDA by default |
-| Apple Silicon | MPS, chosen automatically | **pass `--device mps`**; the default falls back to CPU |
+| Apple Silicon | MPS, chosen automatically | **pass `--device mps --dtype float16`**; the defaults fall back to CPU and float32 |
 | Other | CPU | CPU |
 
 ## Workbench
@@ -227,7 +227,7 @@ The **Jobs** dialog runs the pipeline on the backend's device and rescans when d
 ## Pipeline
 
 Run the commands from the repository root, either with the backend environment activated or
-prefixed with `uv run --project backend`. Add `--device mps` to Step 1 on Apple Silicon.
+prefixed with `uv run --project backend`. Add `--device mps --dtype float16` to Step 1 on Apple Silicon.
 
 ### Step 1: patch embeddings per offset
 
@@ -257,15 +257,24 @@ For each common-offset volume `(il, xl, t)`:
 | `inline_center`, `xline_center`, `time_center` | per axis | Header coordinates of patch centres |
 | `normalize_std`, `clip_sigma`, `num_overlap_patches`, … | scalars | Run metadata |
 
-Runtime: about 9 minutes for 100 offsets (2000 crops) on an RTX 5000 Ada in fp16; the file is about
-2.5 GB. Results were checked against direct forward passes (fp32, no overlap: max diff ~1e-5).
+Results were checked against direct forward passes (fp32, no overlap: max diff ~1e-5). The output
+for 100 offsets is about 2.7 GB in float16.
+
+| Hardware | Settings | 100 offsets |
+|---|---|---|
+| NVIDIA RTX 5000 Ada | CUDA, float16, overlap 7 (2000 crops) | ~9 min |
+| Apple M4 Pro (20-core GPU, 48 GB) | MPS, float16, overlap 7 (2000 crops, 4.5–4.7 crops/s) | 7–7.5 min |
+| Apple M4 Pro | MPS, float16, overlap 0 (1200 crops) | ~4.5 min (extrapolated from 20 offsets) |
+
+On MPS, float32 (the `auto` default there) is about 1.3× slower than float16, and the float16
+embeddings match float32 to a cosine similarity of ≥ 0.9999.
 
 | Flag | Default | Notes |
 |---|---|---|
 | `--offsets` | all | `start:stop[:step]` or `i,j,k`, e.g. `0:100:5` |
-| `--num-overlap-patches` | `7` | `0` is about 2× faster |
+| `--num-overlap-patches` | `7` | `0` cuts crops per offset from 20 to 12 (about 1.6× faster) |
 | `--device` | `cuda` if available, else `cpu` | Use `mps` on Apple Silicon |
-| `--dtype` / `--store-dtype` | `auto` / `float16` | Compute and storage precision |
+| `--dtype` / `--store-dtype` | `auto` / `float16` | Compute and storage precision; `auto` is float16 on CUDA only, so pass `float16` on MPS |
 | `--normalize-std` | estimated | Reuse a previous run's statistics |
 | `--force` | off | Overwrite an existing output |
 
@@ -273,7 +282,7 @@ Runtime: about 9 minutes for 100 offsets (2000 crops) on an RTX 5000 Ada in fp16
 
 ```bash
 python embedders/patch_offset_rms.py --input data/ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time.sgz
-# -> data/<survey>_patch_rms.npz: rms (n_off, n_il, n_xl, n_t) on the patch grid (~90 s)
+# -> data/<survey>_patch_rms.npz: rms (n_off, n_il, n_xl, n_t) on the patch grid (~50 s on an M4 Pro)
 ```
 
 ### Step 2: zero-offset vector and 2-D offset basis
@@ -306,7 +315,8 @@ fit, PCA and variance statistics use live offsets only.
 | `offset_axis_var` | `(…, 2)` | Fraction of variance along each axis; the sum is the plane's share |
 | `live_offsets`, `n_live_offsets` | `(n_off, …)`, `(…)` | Live mask and count; patches with fewer than `--min-live` (4) live offsets are zero |
 
-Other flags: `--zero-offset intercept|nearest`, `--store-dtype`, `--chunk`, `--force`.
+Other flags: `--zero-offset intercept|nearest`, `--store-dtype`, `--chunk`, `--force`. Runtime on the
+full 100-offset embeddings: about 30 s on an M4 Pro.
 
 ### Step 3: figures
 
