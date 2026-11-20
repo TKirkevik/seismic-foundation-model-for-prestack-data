@@ -343,13 +343,13 @@ function renderCanvas() {
       ctx.restore()
     }
 
-    // Feature pick reticle if matching gather location
+    // Passive focusPick reticle if matching gather location
     const loc = dataObj.locations[g]
-    if (store.featurePick && loc) {
-      const fp = store.featurePick
+    if (store.focusPick && loc) {
+      const fp = store.focusPick
       const dist = Math.hypot(fp.il_idx - loc.il_idx, fp.xl_idx - loc.xl_idx)
       if (dist <= 3) {
-        const fx = gx + ((fp.offset_idx + 0.5) / nOffsets) * gatherW
+        const fx = gx + ((store.offsetIndex + 0.5) / nOffsets) * gatherW
         const fy = startY + ((fp.sample_idx + 0.5) / nSamples) * totalContentH
         const exact = dist === 0
         ctx.save()
@@ -584,20 +584,12 @@ function onPointerUp(e: PointerEvent) {
   const loc = gp.value.locations[hit.gatherIdx]
   if (!loc) return
 
-  const offForPick = store.gatherSyncOffsetOnPick ? hit.offIdx : undefined
-  if (store.pickMode && !e.shiftKey) {
-    void store.pickFeature(loc.il_idx, loc.xl_idx, hit.sampleIdx, offForPick ?? hit.offIdx, true)
-    if (store.gatherSyncOffsetOnPick) {
-      store.setCursor({ offsetIndex: hit.offIdx })
-    }
-  } else {
-    store.setCursor({
-      ilIdx: loc.il_idx,
-      xlIdx: loc.xl_idx,
-      sampleIdx: hit.sampleIdx,
-      offsetIndex: store.gatherSyncOffsetOnPick ? hit.offIdx : undefined,
-    })
-  }
+  store.setCursor({
+    ilIdx: loc.il_idx,
+    xlIdx: loc.xl_idx,
+    sampleIdx: hit.sampleIdx,
+    offsetIndex: store.gatherSyncOffsetOnPick ? hit.offIdx : undefined,
+  })
 }
 
 function updateHover(clientX: number, clientY: number) {
@@ -711,7 +703,7 @@ watch(
     () => store.overlayOpacity,
     () => store.offsetIndex,
     () => store.sampleIdx,
-    () => store.featurePick,
+    () => store.focusPick,
     () => store.gatherWiggle,
     () => store.gatherHighlightActiveOffset,
     () => store.reservoirEnvelope,

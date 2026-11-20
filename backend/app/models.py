@@ -78,11 +78,31 @@ class HorizonsResponse(BaseModel):
     meta: dict[str, object] = Field(default_factory=dict)
 
 
-class SimilarityRequest(BaseModel):
-    embedding_set_id: str
+FeaturePlaneAxis = Literal["inline", "xline"]
+FeatureGeometryMode = Literal["single", "points", "polyline", "polygon"]
+FeatureRole = Literal["include", "exclude"]
+
+
+class PickCoord(BaseModel):
     il_idx: int
     xl_idx: int
     sample_idx: int
+
+
+class PickedFeaturePayload(BaseModel):
+    id: str = ""
+    role: FeatureRole = "include"
+    plane_axis: FeaturePlaneAxis
+    plane_index: int
+    geometry_mode: FeatureGeometryMode
+    picks: list[PickCoord]
+
+
+class SimilarityRequest(BaseModel):
+    embedding_set_id: str
+    il_idx: int | None = None
+    xl_idx: int | None = None
+    sample_idx: int | None = None
     offset_idx: int = 0
     mode: Literal[
         "active_offset",
@@ -92,6 +112,9 @@ class SimilarityRequest(BaseModel):
         "combined_trajectory",
     ] = "active_offset"
     whiten: bool = False
+    exclusion_weight: float = Field(default=0.75, ge=0.0, le=2.0)
+    features: list[PickedFeaturePayload] | None = None
+    focus_pick: PickCoord | None = None
 
 
 class PatchCenter(BaseModel):
@@ -144,6 +167,15 @@ class SimilarityResponse(BaseModel):
     similarity_max: float
     similarity_b64: str
     top_matches: list[TopMatch]
+    trajectory: TrajectoryInfo
+    exclusion_weight: float = 0.0
+    included_patch_count: int = 1
+    excluded_patch_count: int = 0
+    overlap_resolved_count: int = 0
+
+
+class FocusTrajectoryResponse(BaseModel):
+    pick: PickInfo
     trajectory: TrajectoryInfo
 
 

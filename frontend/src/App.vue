@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted } from 'vue'
 import {
   Activity,
   AlertTriangle,
@@ -32,8 +32,27 @@ const LAYOUT_BUTTONS: Array<{ id: LayoutMode; label: string; group: 'focus' | 's
   { id: 'workbench-3', label: 'Workbench 3-Pane', group: 'split' },
 ]
 
+function onGlobalKeyDown(e: KeyboardEvent) {
+  if (e.key !== 'Enter' && e.key !== 'Escape') return
+  if (store.jobsModalOpen) return
+  const target = e.target as HTMLElement | null
+  const tag = target?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target?.isContentEditable) {
+    return
+  }
+  if (store.activeDrawingFeature) {
+    e.preventDefault()
+    store.finishActiveDrawing()
+  }
+}
+
 onMounted(() => {
   void store.initialize()
+  window.addEventListener('keydown', onGlobalKeyDown)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKeyDown)
 })
 </script>
 

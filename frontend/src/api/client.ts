@@ -2,6 +2,7 @@ import type {
   AttributeResponse,
   DemoEmbeddingsRequest,
   EmbedJobRequest,
+  FocusTrajectoryResponse,
   GatherLineAxis,
   GatherLocation,
   GatherPanelResponseData,
@@ -196,6 +197,32 @@ export async function fetchSimilarity(
   return parseJsonOrThrow<SimilarityResponse>(res)
 }
 
+export async function fetchFocusTrajectory(
+  surveyId: string,
+  params: {
+    embedding_set_id: string
+    il_idx: number
+    xl_idx: number
+    sample_idx: number
+    offset_idx: number
+  },
+  slot = 'trajectory',
+): Promise<FocusTrajectoryResponse> {
+  const signal = getSlotSignal(slot)
+  const qs = new URLSearchParams({
+    embedding_set_id: params.embedding_set_id,
+    il_idx: String(params.il_idx),
+    xl_idx: String(params.xl_idx),
+    sample_idx: String(params.sample_idx),
+    offset_idx: String(params.offset_idx),
+  })
+  const res = await fetch(
+    `/api/surveys/${encodeURIComponent(surveyId)}/trajectory?${qs.toString()}`,
+    { signal },
+  )
+  return parseJsonOrThrow<FocusTrajectoryResponse>(res)
+}
+
 export async function fetchAttribute(
   surveyId: string,
   embeddingSetId: string,
@@ -230,7 +257,11 @@ export async function startDemoEmbeddingsJob(payload: DemoEmbeddingsRequest): Pr
   const res = await fetch('/api/jobs/demo-embeddings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      survey_id: payload.survey_id,
+      ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      ...(payload.offset_stride !== undefined ? { offset_stride: payload.offset_stride } : {}),
+    }),
   })
   return parseJsonOrThrow<JobInfo>(res)
 }
@@ -239,7 +270,16 @@ export async function startEmbedJob(payload: EmbedJobRequest): Promise<JobInfo> 
   const res = await fetch('/api/jobs/embed', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      survey_id: payload.survey_id,
+      ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      ...(payload.offsets !== undefined ? { offsets: payload.offsets } : {}),
+      ...(payload.num_overlap_patches !== undefined
+        ? { num_overlap_patches: payload.num_overlap_patches }
+        : {}),
+      ...(payload.batch_size !== undefined ? { batch_size: payload.batch_size } : {}),
+      ...(payload.auto_summarize !== undefined ? { auto_summarize: payload.auto_summarize } : {}),
+    }),
   })
   return parseJsonOrThrow<JobInfo>(res)
 }
@@ -248,7 +288,13 @@ export async function startSummarizeJob(payload: SummarizeJobRequest): Promise<J
   const res = await fetch('/api/jobs/summarize', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      survey_id: payload.survey_id,
+      ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      ...(payload.exclude_zero_offset !== undefined
+        ? { exclude_zero_offset: payload.exclude_zero_offset }
+        : {}),
+    }),
   })
   return parseJsonOrThrow<JobInfo>(res)
 }

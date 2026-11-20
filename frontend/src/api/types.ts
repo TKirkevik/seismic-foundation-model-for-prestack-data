@@ -30,7 +30,7 @@ export interface SurveySummary {
   name: string
   sgz_path: string
   is_4d: boolean
-  shape: [number, number, number, number] // [n_il, n_xl, n_samples, n_offsets]
+  shape: [number, number, number] | [number, number, number, number] // [n_il, n_xl, n_samples(, n_offsets)]
   ilines: number[]
   xlines: number[]
   samples: number[]
@@ -96,6 +96,32 @@ export interface GatherPanelResponseData {
   data: Float32Array
 }
 
+export type FeaturePlaneAxis = 'inline' | 'xline'
+export type FeatureGeometryMode = 'single' | 'points' | 'polyline' | 'polygon'
+export type FeatureRole = 'include' | 'exclude'
+
+export interface PickCoord {
+  il_idx: number
+  xl_idx: number
+  sample_idx: number
+}
+
+export interface PickedFeaturePayload {
+  id: string
+  role: FeatureRole
+  plane_axis: FeaturePlaneAxis
+  plane_index: number
+  geometry_mode: FeatureGeometryMode
+  picks: PickCoord[]
+}
+
+export interface PickedFeature extends PickedFeaturePayload {
+  name: string
+  enabled: boolean
+  status: 'in_progress' | 'completed'
+  createdAt: number
+}
+
 export interface FeaturePick {
   il_idx: number
   xl_idx: number
@@ -105,12 +131,15 @@ export interface FeaturePick {
 
 export interface SimilarityRequest {
   embedding_set_id: string
-  il_idx: number
-  xl_idx: number
-  sample_idx: number
   offset_idx: number
   mode: string
   whiten: boolean
+  exclusion_weight?: number
+  features?: PickedFeaturePayload[]
+  focus_pick?: PickCoord | null
+  il_idx?: number
+  xl_idx?: number
+  sample_idx?: number
 }
 
 export interface SimilarityMatch {
@@ -156,6 +185,15 @@ export interface SimilarityResponse {
   similarity_b64: string
   top_matches: SimilarityMatch[]
   trajectory: TrajectoryData
+  exclusion_weight?: number
+  included_patch_count?: number
+  excluded_patch_count?: number
+  overlap_resolved_count?: number
+}
+
+export interface FocusTrajectoryResponse {
+  pick: SimilarityResponse['pick']
+  trajectory: TrajectoryData
 }
 
 export interface AttributeResponse {
@@ -170,34 +208,37 @@ export interface AttributeResponse {
   values_b64: string
 }
 
-export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+export type JobStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'unsupported'
 
 export interface JobInfo {
   id: string
-  type?: string
-  kind?: string
-  title?: string
-  survey_id?: string
+  job_type: string
+  survey_id: string | null
   status: JobStatus | string
-  progress?: number
-  stage?: string
-  message?: string
-  error?: string | null
-  logs?: string[]
-  log_tail?: string
-  created_at?: string
-  updated_at?: string
+  progress_pct: number
+  message: string
+  logs_tail: string[]
+  created_at: string
+  finished_at: string | null
+  output_path: string | null
 }
 
 export interface DemoEmbeddingsRequest {
   survey_id: string
-  embedding_set_id?: string
+  tag?: string
+  offset_stride?: number
 }
 
 export interface EmbedJobRequest {
   survey_id: string
-  embedding_set_id?: string
-  offsets?: string
+  tag?: string
+  offsets?: string | null
   num_overlap_patches?: number
   batch_size?: number
   auto_summarize?: boolean
@@ -205,7 +246,7 @@ export interface EmbedJobRequest {
 
 export interface SummarizeJobRequest {
   survey_id: string
-  embedding_set_id?: string
+  tag?: string
   exclude_zero_offset?: boolean
 }
 
