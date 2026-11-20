@@ -1,9 +1,18 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Crosshair, RotateCcw } from 'lucide-vue-next'
-import type { SectionAxis } from '../api/types'
+import type { FeatureGeometryMode, PickedFeature, SectionAxis } from '../api/types'
 import { useWorkbenchStore } from '../stores/workbench'
 import { getOverlayLUT, getSeismicLUT } from '../utils/colormaps'
+import {
+  EDGE_HIT_RADIUS_PX,
+  HANDLE_HIT_RADIUS_PX,
+  ROLE_COLORS,
+  hitTestEdges,
+  hitTestHandles,
+  type EdgeCandidate,
+  type HandleCandidate,
+} from '../utils/featureGeometry'
 import { buildAxisLookup } from '../utils/interpolation'
 
 const props = withDefaults(
@@ -40,6 +49,22 @@ let panStartClientY = 0
 let panOriginX = 0
 let panOriginY = 0
 let pointerDownMoved = false
+
+const draggingHandle = ref<{ featureId: string; pickIndex: number } | null>(null)
+let lastPrimaryClickTime = 0
+let lastClickX = 0
+let lastClickY = 0
+let justFinishedUntil = 0
+
+const hoverCanvasPos = ref<{ x: number; y: number } | null>(null)
+const hoveredEdge = ref<{ featureId: string; segmentIndex: number } | null>(null)
+
+const GEOM_OPTIONS: Array<{ id: FeatureGeometryMode; label: string }> = [
+  { id: 'single', label: '1-Pick' },
+  { id: 'points', label: 'Points' },
+  { id: 'polyline', label: 'Line' },
+  { id: 'polygon', label: 'Polygon' },
+]
 
 // Hover state
 const hoverInfo = ref<{
@@ -91,6 +116,23 @@ const sliceReadout = computed(() => {
 
 const currentSection = computed(() => store.sections[axis.value])
 const isLoading = computed(() => store.sectionLoading[axis.value])
+
+const isDrawingOnThisPlane = computed(() => {
+  const d = store.activeDrawingFeature
+  return (
+    d !== null &&
+    (axis.value === 'inline' || axis.value === 'xline') &&
+    d.plane_axis === axis.value &&
+    d.plane_index === sliceIndex.value
+  )
+})
+
+const canvasCursorClass = computed(() => {
+  if (draggingHandle.value) return 'cursor-grabbing'
+  if (store.hoveredPickRef && !isDrawingOnThisPlane.value) return 'cursor-grab'
+  if (hoveredEdge.value && !isDrawingOnThisPlane.value && store.pickMode) return 'cursor-copy'
+  return 'cursor-crosshair'
+})
 
 function getDataDims(): [number, number] {
   const sec = currentSection.value
@@ -493,48 +535,153 @@ function renderCanvas() {
     ctx.restore()
   }
 
-  // Active Feature Pick reticle
-  if (store.featurePick && survey.value) {
-    const fp = store.featurePick
-    const fx = axis.value === 'xline' ? fp.il_idx : fp.xl_idx
-    const fy = axis.value === 'sample' ? fp.il_idx : fp.sample_idx
-    const delta =
-      axis.value === 'inline'
-        ? Math.abs(fp.il_idx - store.ilIdx)
-        : axis.value === 'xline'
-          ? Math.abs(fp.xl_idx - store.xlIdx)
-          : Math.abs(fp.sample_idx - store.sampleIdx)
+  // Picked Features overlay (coplanarity guard: only features on this axis)
+  if (survey.value && (axis.value === 'inline' || axis.value === 'xline')) {
+    const curPlaneAxis = axis.value
+    const curSliceIdx = sliceIndex.value
+    const getHorizIdx = (f: PickedFeature, pIdx: number) =>
+      curPlaneAxis === 'inline' ? f.picks[pIdx].xl_idx : f.picks[pIdx].il_idx
 
-    const sx = toScreenX(fx)
-    const sy = toScreenY(fy)
-    const onPlane = delta === 0
-    const nearPlane = delta <= 8
+    for (const feat of store.pickedFeatures) {
+      if (!feat.enabled || feat.picks.length === 0) continue
+      if (feat.plane_axis !== curPlaneAxis) continue
 
-    ctx.save()
-    ctx.strokeStyle = onPlane ? '#22d3ee' : nearPlane ? 'rgba(34, 211, 238, 0.7)' : 'rgba(148, 163, 184, 0.55)'
-    ctx.lineWidth = onPlane ? 2 : 1.25
-    if (!onPlane) ctx.setLineDash([3, 3])
-    ctx.beginPath()
-    ctx.arc(sx, sy, onPlane ? 9 : 7, 0, Math.PI * 2)
-    ctx.stroke()
+      const delta = Math.abs(feat.plane_index - curSliceIdx)
+      if (delta > 8) continue
 
-    ctx.setLineDash([])
-    ctx.beginPath()
-    ctx.moveTo(sx - 13, sy)
-    ctx.lineTo(sx - 4, sy)
-    ctx.moveTo(sx + 4, sy)
-    ctx.lineTo(sx + 13, sy)
-    ctx.moveTo(sx, sy - 13)
-    ctx.lineTo(sx, sy - 4)
-    ctx.moveTo(sx, sy + 4)
-    ctx.lineTo(sx, sy + 13)
-    ctx.stroke()
+      const colors = ROLE_COLORS[feat.role]
+      const onPlane = delta === 0
+      const isSelected = feat.id === store.selectedFeatureId
+      const isDrawing = feat.status === 'in_progress' && onPlane
 
-    ctx.fillStyle = onPlane ? '#22d3ee' : '#94a3b8'
-    ctx.beginPath()
-    ctx.arc(sx, sy, 2.5, 0, Math.PI * 2)
-    ctx.fill()
-    ctx.restore()
+      const pts = feat.picks.map((p, idx) => ({
+        x: toScreenX(getHorizIdx(feat, idx)),
+        y: toScreenY(p.sample_idx),
+      }))
+
+      ctx.save()
+      if (!onPlane) {
+        ctx.globalAlpha = 0.4
+        ctx.setLineDash([4, 4])
+      }
+
+      // Draw geometry body
+      if (feat.geometry_mode === 'polygon') {
+        if (pts.length >= 3) {
+          ctx.beginPath()
+          ctx.moveTo(pts[0].x, pts[0].y)
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
+          if (!isDrawing) ctx.closePath()
+          if (onPlane) {
+            ctx.fillStyle = colors.fill
+            ctx.fill('evenodd')
+          }
+          ctx.strokeStyle = colors.primary
+          ctx.lineWidth = isSelected && onPlane ? 2.4 : 1.8
+          ctx.stroke()
+        } else if (pts.length === 2) {
+          ctx.beginPath()
+          ctx.moveTo(pts[0].x, pts[0].y)
+          ctx.lineTo(pts[1].x, pts[1].y)
+          ctx.strokeStyle = colors.primary
+          ctx.lineWidth = isSelected && onPlane ? 2.4 : 1.8
+          ctx.stroke()
+        }
+
+        // Rubber-band segment while drawing
+        if (isDrawing && hoverCanvasPos.value && pts.length >= 1) {
+          ctx.save()
+          ctx.setLineDash([6, 3])
+          ctx.strokeStyle = colors.primary
+          ctx.lineWidth = 1.5
+          ctx.beginPath()
+          ctx.moveTo(pts[pts.length - 1].x, pts[pts.length - 1].y)
+          ctx.lineTo(hoverCanvasPos.value.x, hoverCanvasPos.value.y)
+          if (pts.length >= 2) {
+            ctx.lineTo(pts[0].x, pts[0].y)
+          }
+          ctx.stroke()
+          ctx.restore()
+        }
+      } else if (feat.geometry_mode === 'polyline') {
+        if (pts.length >= 2) {
+          ctx.beginPath()
+          ctx.moveTo(pts[0].x, pts[0].y)
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
+          ctx.strokeStyle = colors.primary
+          ctx.lineWidth = isSelected && onPlane ? 2.4 : 1.8
+          ctx.stroke()
+        }
+        if (isDrawing && hoverCanvasPos.value && pts.length >= 1) {
+          ctx.save()
+          ctx.setLineDash([6, 3])
+          ctx.strokeStyle = colors.primary
+          ctx.lineWidth = 1.5
+          ctx.beginPath()
+          ctx.moveTo(pts[pts.length - 1].x, pts[pts.length - 1].y)
+          ctx.lineTo(hoverCanvasPos.value.x, hoverCanvasPos.value.y)
+          ctx.stroke()
+          ctx.restore()
+        }
+      }
+
+      // Draw handles / reticles
+      ctx.setLineDash([])
+      for (let i = 0; i < pts.length; i++) {
+        const pt = pts[i]
+        const isHovered =
+          onPlane &&
+          store.hoveredPickRef?.featureId === feat.id &&
+          store.hoveredPickRef?.pickIndex === i
+        const isDragged =
+          onPlane &&
+          draggingHandle.value?.featureId === feat.id &&
+          draggingHandle.value?.pickIndex === i
+
+        if (feat.geometry_mode === 'single') {
+          const r = isHovered || isDragged ? 10 : onPlane ? 8 : 6
+          ctx.strokeStyle = isHovered || isDragged ? '#ffffff' : colors.primary
+          ctx.lineWidth = isHovered || isDragged ? 2.2 : onPlane ? 1.8 : 1.2
+          ctx.beginPath()
+          ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2)
+          ctx.stroke()
+
+          ctx.beginPath()
+          ctx.moveTo(pt.x - 13, pt.y)
+          ctx.lineTo(pt.x - 4, pt.y)
+          ctx.moveTo(pt.x + 4, pt.y)
+          ctx.lineTo(pt.x + 13, pt.y)
+          ctx.moveTo(pt.x, pt.y - 13)
+          ctx.lineTo(pt.x, pt.y - 4)
+          ctx.moveTo(pt.x, pt.y + 4)
+          ctx.lineTo(pt.x, pt.y + 13)
+          ctx.stroke()
+
+          ctx.fillStyle = isHovered || isDragged ? '#fbbf24' : colors.primary
+          ctx.beginPath()
+          ctx.arc(pt.x, pt.y, isHovered || isDragged ? 3.2 : 2.5, 0, Math.PI * 2)
+          ctx.fill()
+        } else {
+          const r = isHovered || isDragged ? 7.5 : onPlane ? 5 : 3.5
+          ctx.fillStyle = isHovered || isDragged ? '#fbbf24' : '#020617'
+          ctx.strokeStyle = isHovered || isDragged ? '#ffffff' : colors.primary
+          ctx.lineWidth = isHovered || isDragged ? 2.2 : 1.75
+          ctx.beginPath()
+          ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.stroke()
+
+          if (onPlane) {
+            ctx.fillStyle = isHovered || isDragged ? '#ffffff' : colors.primary
+            ctx.beginPath()
+            ctx.arc(pt.x, pt.y, 2, 0, Math.PI * 2)
+            ctx.fill()
+          }
+        }
+      }
+
+      ctx.restore()
+    }
   }
 
   ctx.restore() // end plot clip
@@ -647,7 +794,11 @@ function resizeCanvas() {
   scheduleRender()
 }
 
-function screenToData(clientX: number, clientY: number): { gx: number; gy: number } | null {
+function screenToData(
+  clientX: number,
+  clientY: number,
+  clamp = false,
+): { gx: number; gy: number } | null {
   const canvas = canvasRef.value
   if (!canvas) return null
   const rect = canvas.getBoundingClientRect()
@@ -657,21 +808,119 @@ function screenToData(clientX: number, clientY: number): { gx: number; gy: numbe
     rect.width,
     rect.height,
   )
-  if (mx < plotX || mx > plotX + plotW || my < plotY || my > plotY + plotH) {
+  if (!clamp && (mx < plotX || mx > plotX + plotW || my < plotY || my > plotY + plotH)) {
     return null
   }
   const [dataW, dataH] = getDataDims()
-  const gx = Math.floor(((mx - drawX) / drawW) * dataW)
-  const gy = Math.floor(((my - drawY) / drawH) * dataH)
+  let gx = Math.floor(((mx - drawX) / drawW) * dataW)
+  let gy = Math.floor(((my - drawY) / drawH) * dataH)
+  if (clamp) {
+    gx = Math.max(0, Math.min(dataW - 1, gx))
+    gy = Math.max(0, Math.min(dataH - 1, gy))
+    return { gx, gy }
+  }
   if (gx < 0 || gx >= dataW || gy < 0 || gy >= dataH) return null
   return { gx, gy }
+}
+
+function getPlaneHandleAndEdgeCandidates() {
+  const canvas = canvasRef.value
+  if (!canvas || (axis.value !== 'inline' && axis.value !== 'xline')) {
+    return { handles: [] as HandleCandidate[], edges: [] as EdgeCandidate[] }
+  }
+  const rect = canvas.getBoundingClientRect()
+  const { drawX, drawY, drawW, drawH } = getViewportRect(rect.width, rect.height)
+  const [dataW, dataH] = getDataDims()
+  const toScreenX = (gx: number) => drawX + ((gx + 0.5) / dataW) * drawW
+  const toScreenY = (gy: number) => drawY + ((gy + 0.5) / dataH) * drawH
+
+  const curAxis = axis.value
+  const curSlice = sliceIndex.value
+  const handles: HandleCandidate[] = []
+  const edges: EdgeCandidate[] = []
+
+  for (const feat of store.pickedFeatures) {
+    if (!feat.enabled || feat.picks.length === 0) continue
+    if (feat.plane_axis !== curAxis || feat.plane_index !== curSlice) continue
+
+    const pts = feat.picks.map((p) => ({
+      x: toScreenX(curAxis === 'inline' ? p.xl_idx : p.il_idx),
+      y: toScreenY(p.sample_idx),
+    }))
+
+    for (let i = 0; i < pts.length; i++) {
+      handles.push({
+        featureId: feat.id,
+        pickIndex: i,
+        x: pts[i].x,
+        y: pts[i].y,
+      })
+    }
+
+    if (
+      feat.status === 'completed' &&
+      (feat.geometry_mode === 'polyline' || feat.geometry_mode === 'polygon') &&
+      pts.length >= 2
+    ) {
+      edges.push({
+        featureId: feat.id,
+        geometryMode: feat.geometry_mode,
+        points: pts,
+      })
+    }
+  }
+
+  return { handles, edges }
+}
+
+function onMouseDown(e: MouseEvent) {
+  if (e.button === 1) {
+    e.preventDefault()
+  }
 }
 
 function onPointerDown(e: PointerEvent) {
   const canvas = canvasRef.value
   if (!canvas) return
+  if (e.button === 1) e.preventDefault()
   canvas.setPointerCapture(e.pointerId)
   pointerDownMoved = false
+
+  const rect = canvas.getBoundingClientRect()
+  const mx = e.clientX - rect.left
+  const my = e.clientY - rect.top
+  const { handles } = getPlaneHandleAndEdgeCandidates()
+  const hitHandle = hitTestHandles(mx, my, handles, HANDLE_HIT_RADIUS_PX)
+
+  if (isDrawingOnThisPlane.value) {
+    if (e.button === 1 && hitHandle) {
+      e.preventDefault()
+      store.deletePick(hitHandle.featureId, hitHandle.pickIndex)
+      return
+    }
+    if (e.button === 1 || e.button === 2 || e.altKey) {
+      isPanning = true
+    }
+    panStartClientX = e.clientX
+    panStartClientY = e.clientY
+    panOriginX = panX.value
+    panOriginY = panY.value
+    return
+  }
+
+  if (hitHandle) {
+    if (e.button === 0) {
+      draggingHandle.value = { featureId: hitHandle.featureId, pickIndex: hitHandle.pickIndex }
+      store.selectedFeatureId = hitHandle.featureId
+      store.setHoveredPick(draggingHandle.value)
+      return
+    }
+    if (e.button === 1) {
+      e.preventDefault()
+      store.deletePick(hitHandle.featureId, hitHandle.pickIndex)
+      return
+    }
+  }
 
   if (e.button === 1 || e.button === 2 || e.altKey) {
     isPanning = true
@@ -688,6 +937,27 @@ function onPointerDown(e: PointerEvent) {
 }
 
 function onPointerMove(e: PointerEvent) {
+  const canvas = canvasRef.value
+  if (canvas) {
+    const rect = canvas.getBoundingClientRect()
+    hoverCanvasPos.value = { x: e.clientX - rect.left, y: e.clientY - rect.top }
+  }
+
+  if (draggingHandle.value) {
+    const clamped = screenToData(e.clientX, e.clientY, true)
+    if (clamped) {
+      store.movePick(
+        draggingHandle.value.featureId,
+        draggingHandle.value.pickIndex,
+        clamped.gx,
+        clamped.gy,
+        { commit: false },
+      )
+    }
+    scheduleRender()
+    return
+  }
+
   if (isPanning) {
     const dx = e.clientX - panStartClientX
     const dy = e.clientY - panStartClientY
@@ -698,7 +968,7 @@ function onPointerMove(e: PointerEvent) {
     return
   }
 
-  if (e.buttons === 1) {
+  if (e.buttons === 1 && !isDrawingOnThisPlane.value) {
     const dx = e.clientX - panStartClientX
     const dy = e.clientY - panStartClientY
     if (Math.hypot(dx, dy) > 4) {
@@ -711,6 +981,30 @@ function onPointerMove(e: PointerEvent) {
     }
   }
 
+  if (e.buttons === 0 && canvas) {
+    const rect = canvas.getBoundingClientRect()
+    const mx = e.clientX - rect.left
+    const my = e.clientY - rect.top
+    if (!isDrawingOnThisPlane.value) {
+      const { handles, edges } = getPlaneHandleAndEdgeCandidates()
+      const hitHandle = hitTestHandles(mx, my, handles, HANDLE_HIT_RADIUS_PX)
+      if (hitHandle) {
+        store.setHoveredPick({ featureId: hitHandle.featureId, pickIndex: hitHandle.pickIndex })
+        hoveredEdge.value = null
+      } else {
+        store.setHoveredPick(null)
+        const hitEdge = hitTestEdges(mx, my, edges, EDGE_HIT_RADIUS_PX)
+        hoveredEdge.value = hitEdge
+          ? { featureId: hitEdge.featureId, segmentIndex: hitEdge.segmentIndex }
+          : null
+      }
+    } else {
+      store.setHoveredPick(null)
+      hoveredEdge.value = null
+      scheduleRender()
+    }
+  }
+
   updateHover(e.clientX, e.clientY)
 }
 
@@ -720,6 +1014,22 @@ function onPointerUp(e: PointerEvent) {
     canvas.releasePointerCapture(e.pointerId)
   }
 
+  if (draggingHandle.value) {
+    const clamped = screenToData(e.clientX, e.clientY, true)
+    if (clamped) {
+      store.movePick(
+        draggingHandle.value.featureId,
+        draggingHandle.value.pickIndex,
+        clamped.gx,
+        clamped.gy,
+        { commit: true },
+      )
+    }
+    draggingHandle.value = null
+    scheduleRender()
+    return
+  }
+
   if (isPanning) {
     isPanning = false
     if (pointerDownMoved) return
@@ -727,13 +1037,78 @@ function onPointerUp(e: PointerEvent) {
 
   if (e.button !== 0 || pointerDownMoved) return
 
+  const now = performance.now()
+  if (now < justFinishedUntil) {
+    return
+  }
+
   const coords = screenToData(e.clientX, e.clientY)
   if (!coords || !survey.value) return
 
+  const onExactVerticalPlane = axis.value === 'inline' || axis.value === 'xline'
+
+  if (isDrawingOnThisPlane.value && onExactVerticalPlane) {
+    const isDoubleClick =
+      e.detail >= 2 ||
+      (now - lastPrimaryClickTime < 320 &&
+        Math.hypot(e.clientX - lastClickX, e.clientY - lastClickY) < 8)
+
+    if (isDoubleClick) {
+      justFinishedUntil = now + 260
+      lastPrimaryClickTime = 0
+      void store.placePickOnPlane(
+        axis.value as 'inline' | 'xline',
+        sliceIndex.value,
+        coords.gx,
+        coords.gy,
+        { isDoubleClick: true },
+      )
+    } else {
+      lastPrimaryClickTime = now
+      lastClickX = e.clientX
+      lastClickY = e.clientY
+      void store.placePickOnPlane(
+        axis.value as 'inline' | 'xline',
+        sliceIndex.value,
+        coords.gx,
+        coords.gy,
+      )
+    }
+    return
+  }
+
+  if (onExactVerticalPlane && store.pickMode && !e.shiftKey && canvas) {
+    const rect = canvas.getBoundingClientRect()
+    const mx = e.clientX - rect.left
+    const my = e.clientY - rect.top
+    const { edges } = getPlaneHandleAndEdgeCandidates()
+    const hitEdge = hitTestEdges(mx, my, edges, EDGE_HIT_RADIUS_PX)
+    if (hitEdge) {
+      store.insertPickOnSegment(
+        hitEdge.featureId,
+        hitEdge.segmentIndex,
+        coords.gx,
+        coords.gy,
+      )
+      return
+    }
+
+    lastPrimaryClickTime = now
+    lastClickX = e.clientX
+    lastClickY = e.clientY
+    void store.placePickOnPlane(
+      axis.value as 'inline' | 'xline',
+      sliceIndex.value,
+      coords.gx,
+      coords.gy,
+    )
+    return
+  }
+
+  // Cursor-only navigation (Time Slice, Shift+Click, or Pick mode off)
   let targetIl = store.ilIdx
   let targetXl = store.xlIdx
   let targetSample = store.sampleIdx
-
   if (axis.value === 'inline') {
     targetXl = coords.gx
     targetSample = coords.gy
@@ -744,12 +1119,40 @@ function onPointerUp(e: PointerEvent) {
     targetXl = coords.gx
     targetIl = coords.gy
   }
+  store.setCursor({ ilIdx: targetIl, xlIdx: targetXl, sampleIdx: targetSample })
+}
 
-  const shouldPick = store.pickMode && !e.shiftKey
-  if (shouldPick) {
-    void store.pickFeature(targetIl, targetXl, targetSample, undefined, true)
-  } else {
-    store.setCursor({ ilIdx: targetIl, xlIdx: targetXl, sampleIdx: targetSample })
+function onPointerCancel(e: PointerEvent) {
+  const canvas = canvasRef.value
+  if (canvas && canvas.hasPointerCapture(e.pointerId)) {
+    canvas.releasePointerCapture(e.pointerId)
+  }
+  if (draggingHandle.value) {
+    const clamped = screenToData(e.clientX, e.clientY, true)
+    if (clamped) {
+      store.movePick(
+        draggingHandle.value.featureId,
+        draggingHandle.value.pickIndex,
+        clamped.gx,
+        clamped.gy,
+        { commit: true },
+      )
+    }
+    draggingHandle.value = null
+  }
+  isPanning = false
+  scheduleRender()
+}
+
+function onPointerLeave() {
+  hoverInfo.value = null
+  hoverCanvasPos.value = null
+  hoveredEdge.value = null
+  if (!draggingHandle.value) {
+    store.setHoveredPick(null)
+  }
+  if (isDrawingOnThisPlane.value) {
+    scheduleRender()
   }
 }
 
@@ -909,12 +1312,15 @@ watch(
 watch(
   [
     () => store.overlayOpacity,
-    () => store.featurePick,
+    () => store.pickedFeatures,
+    () => store.selectedFeatureId,
+    () => store.hoveredPickRef,
     () => store.gatherPanelData,
   ],
   () => {
     scheduleRender()
   },
+  { deep: true },
 )
 </script>
 
@@ -980,21 +1386,79 @@ watch(
         </span>
       </div>
 
-      <div class="flex items-center gap-1.5 ml-auto">
+      <div class="flex items-center gap-1.5 ml-auto flex-wrap">
+        <!-- Quick Geometry Mode & Role Pills (on vertical sections) -->
+        <div
+          v-if="axis !== 'sample'"
+          class="hidden md:flex items-center rounded bg-slate-950 border border-slate-800 p-0.5"
+        >
+          <button
+            v-for="opt in GEOM_OPTIONS"
+            :key="opt.id"
+            type="button"
+            class="px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors"
+            :class="
+              store.activeGeometryMode === opt.id
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                : 'text-slate-400 hover:text-slate-200 border border-transparent'
+            "
+            @click="store.setGeometryMode(opt.id)"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
+
+        <div
+          v-if="axis !== 'sample'"
+          class="hidden md:flex items-center rounded bg-slate-950 border border-slate-800 p-0.5"
+        >
+          <button
+            type="button"
+            class="px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors"
+            :class="
+              store.activeFeatureRole === 'include'
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                : 'text-slate-400 hover:text-slate-200 border border-transparent'
+            "
+            @click="store.setFeatureRole('include')"
+          >
+            + Inc
+          </button>
+          <button
+            type="button"
+            class="px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors"
+            :class="
+              store.activeFeatureRole === 'exclude'
+                ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                : 'text-slate-400 hover:text-slate-200 border border-transparent'
+            "
+            @click="store.setFeatureRole('exclude')"
+          >
+            − Exc
+          </button>
+        </div>
+
         <!-- Pick Feature vs Cursor mode -->
         <button
           type="button"
           class="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium border transition-colors"
+          :disabled="axis === 'sample'"
           :class="
-            store.pickMode
-              ? 'bg-cyan-500/15 border-cyan-500/50 text-cyan-300'
-              : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+            axis === 'sample'
+              ? 'bg-slate-950/60 border-slate-800/70 text-slate-600 cursor-not-allowed'
+              : store.pickMode
+                ? 'bg-cyan-500/15 border-cyan-500/50 text-cyan-300'
+                : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
           "
-          title="Left-click picks a Feature Pick (Shift+Click moves cursor only)"
+          :title="
+            axis === 'sample'
+              ? 'Picking is available on Inline and Crossline vertical sections'
+              : 'Left-click picks a Feature (Shift+Click moves cursor only)'
+          "
           @click="store.pickMode = !store.pickMode"
         >
           <Crosshair class="w-3 h-3" />
-          <span>Click to Pick Feature</span>
+          <span>{{ axis === 'sample' ? 'Cursor Only' : 'Pick' }}</span>
         </button>
 
         <button
@@ -1013,14 +1477,34 @@ watch(
     <div ref="containerRef" class="relative flex-1 min-h-0 overflow-hidden bg-slate-950">
       <canvas
         ref="canvasRef"
-        class="block w-full h-full cursor-crosshair"
+        class="block w-full h-full"
+        :class="canvasCursorClass"
+        @mousedown="onMouseDown"
         @pointerdown="onPointerDown"
         @pointermove="onPointerMove"
         @pointerup="onPointerUp"
-        @pointerleave="hoverInfo = null"
+        @pointercancel="onPointerCancel"
+        @pointerleave="onPointerLeave"
         @wheel="onWheel"
+        @auxclick.prevent
         @contextmenu.prevent
       />
+
+      <!-- Drawing in-progress badge -->
+      <div
+        v-if="isDrawingOnThisPlane"
+        class="absolute top-8 left-16 z-10 flex items-center gap-1.5 px-2 py-0.5 rounded bg-slate-950/90 border border-amber-500/50 text-amber-200 text-[10px] shadow-lg"
+      >
+        <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+        <span>Drawing… (Double-click or Enter to finish)</span>
+        <button
+          type="button"
+          class="px-1.5 py-0.2 rounded bg-amber-500/30 hover:bg-amber-500/50 text-amber-100 font-semibold"
+          @click="store.finishActiveDrawing()"
+        >
+          Finish
+        </button>
+      </div>
 
       <!-- Loading badge -->
       <div

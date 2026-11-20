@@ -15,6 +15,9 @@ latent space as a function of offset.
 | `embedders/patch_offset_rms.py` | Step 1b – per-patch, per-offset RMS of the input data (live-offset / mute detection) |
 | `embedders/offset_direction_summarizer.py` | Step 2 – zero-offset vector + 2-D offset basis per patch |
 | `visualization/plot_offset_summary.py` | Step 3 – PNG figures of the summary (`figures/`, not tracked) |
+| `backend/` | FastAPI + `uv` cross-platform (`CUDA` / Mac M4 `MPS`) server for `.sgz` slicing, GPU/MPS similarity search, and `embedders/` job orchestration |
+| `frontend/` | Vue 3 + TypeScript + Three.js workbench (Section Viewer, 3D Cube Viewer, Pre-Stack Gather Panel, Similarity & Offset Trajectory inspector) |
+| `GLOSSARY.md` | Canonical domain glossary |
 
 Current dataset: `ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time.sgz` — 193 inlines × 303 crosslines ×
 1126 samples (4 ms) × 100 offsets (−4950 … +4950 m, 100 m steps; no exact zero offset).
@@ -159,3 +162,27 @@ faint/grey in the trajectory plots.
 - Per-offset normalisation (instead of a global std) to isolate waveform/shape changes from
   amplitude-vs-offset.
 - Cluster on trajectory *shape* (`offset_coords` over live offsets) rather than on direction.
+- Visualise `offset_coords` trajectories, `offset_slope` and `offset_axis_var` as maps to find
+  where offset behaviour is strong, linear or curved.
+
+## Interactive Workbench (Backend + Frontend)
+
+### 1. Backend (`uv` — Windows/Linux CUDA & macOS M4 MPS)
+
+```powershell
+cd backend
+uv sync
+# Optional: generate fast signal-derived demo embeddings (<5 s) before full ViT inference finishes
+uv run python scripts/generate_demo_embeddings.py --input ../data/ST0202R08_PZ_PrSDM_CIP_gathers_in_PP_Time.sgz
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+### 2. Frontend (Vue 3 + Vite)
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173` to explore **Common-Offset Volumes**, **Sections**, stepped **Gather Panels**, **3D Cube slices & Patch clouds**, single-pick and multi-pick **Picked Features** (`single`, `points`, `polyline`, `polygon` on Inline/Crossline Sections with **Inclusion (+)** and **Exclusion (−)** refinement across `active_offset`, `zero_offset`, `offset_direction`, `offset_curvature`, and `combined_trajectory`), **Offset Trajectory** `(c₁, c₂)` curves, and launch/monitor `embedders/` jobs from the UI.

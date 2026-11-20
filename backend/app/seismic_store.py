@@ -30,10 +30,11 @@ class SurveyHandle:
     default_offset_index: int
     amplitude_clip_default: float
     pool_size: int = 4
+    mtime_ns: int = 0
+    file_size: int = 0
     _pool: queue.LifoQueue[SgzReader] = field(init=False, repr=False)
     _sem: threading.BoundedSemaphore = field(init=False, repr=False)
     _lock: threading.Lock = field(init=False, repr=False)
-    _all_readers: list[SgzReader] = field(default_factory=list, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -43,16 +44,22 @@ class SurveyHandle:
 
     def seed_reader(self, reader: SgzReader) -> None:
         with self._lock:
-            self._all_readers.append(reader)
-        self._pool.put_nowait(reader)
+            if self._closed:
+                reader.close()
+                return
+            self._pool.put_nowait(reader)
 
     @contextmanager
     def acquire(self) -> Iterator[SgzReader]:
-        if self._closed:
-            raise RuntimeError(f"SurveyHandle {self.survey_id} is closed")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(f"SurveyHandle {self.survey_id} is closed")
         self._sem.acquire()
         reader: SgzReader | None = None
         try:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError(f"SurveyHandle {self.survey_id} is closed")
             try:
                 reader = self._pool.get_nowait()
             except queue.Empty:
@@ -60,33 +67,36 @@ class SurveyHandle:
                 with self._lock:
                     if self._closed:
                         reader.close()
+                        reader = None
                         raise RuntimeError(f"SurveyHandle {self.survey_id} is closed")
-                    self._all_readers.append(reader)
             yield reader
         finally:
             if reader is not None:
-                if self._closed:
+                close_now = False
+                with self._lock:
+                    if self._closed:
+                        close_now = True
+                    else:
+                        self._pool.put_nowait(reader)
+                if close_now:
                     try:
                         reader.close()
                     except Exception:
                         pass
-                else:
-                    self._pool.put_nowait(reader)
             self._sem.release()
 
     def close(self) -> None:
+        idle_readers: list[SgzReader] = []
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            readers = list(self._all_readers)
-            self._all_readers.clear()
-        while not self._pool.empty():
-            try:
-                self._pool.get_nowait()
-            except queue.Empty:
-                break
-        for reader in readers:
+            while not self._pool.empty():
+                try:
+                    idle_readers.append(self._pool.get_nowait())
+                except queue.Empty:
+                    break
+        for reader in idle_readers:
             try:
                 reader.close()
             except Exception as exc:
@@ -136,56 +146,77 @@ class SeismicStore:
         self.data_dir = Path(data_dir)
         self.pool_size = max(1, pool_size)
         self._lock = threading.RLock()
+        self._scan_lock = threading.Lock()
         self._surveys: dict[str, SurveyHandle] = {}
 
     def scan(self) -> dict[str, SurveyHandle]:
-        new_surveys: dict[str, SurveyHandle] = {}
-        if self.data_dir.is_dir():
-            sgz_files = sorted(self.data_dir.glob("*.sgz"), key=lambda p: p.name.lower())
-        else:
-            sgz_files = []
+        with self._scan_lock:
+            if self.data_dir.is_dir():
+                sgz_files = sorted(self.data_dir.glob("*.sgz"), key=lambda p: p.name.lower())
+            else:
+                sgz_files = []
 
-        for sgz_path in sgz_files:
-            survey_id = sgz_path.stem
-            try:
-                reader = SgzReader(str(sgz_path))
-                if not (reader.is_4d or reader.is_3d):
-                    reader.close()
-                    log.info("Skipping 2D SGZ file %s", sgz_path)
-                    continue
-                offsets_arr = np.asarray(reader.offsets, dtype=np.float64) if reader.is_4d else np.empty(0)
-                default_offset_idx = _pick_default_offset_index(offsets_arr) if reader.is_4d else 0
-                clip = _estimate_amplitude_clip(reader, default_offset_idx)
-                shape = (
-                    [int(reader.n_ilines), int(reader.n_xlines), int(reader.n_samples), int(reader.n_offsets)]
-                    if reader.is_4d
-                    else [int(reader.n_ilines), int(reader.n_xlines), int(reader.n_samples)]
-                )
-                handle = SurveyHandle(
-                    survey_id=survey_id,
-                    name=survey_id,
-                    sgz_path=sgz_path.resolve(),
-                    is_4d=bool(reader.is_4d),
-                    shape=shape,
-                    ilines=[int(x) for x in reader.ilines],
-                    xlines=[int(x) for x in reader.xlines],
-                    samples=[float(x) for x in reader.zslices],
-                    offsets=[float(x) for x in offsets_arr],
-                    default_offset_index=default_offset_idx,
-                    amplitude_clip_default=clip,
-                    pool_size=self.pool_size,
-                )
-                handle.seed_reader(reader)
-                new_surveys[survey_id] = handle
-            except Exception as exc:
-                log.exception("Failed to index SGZ file %s: %s", sgz_path, exc)
+            with self._lock:
+                existing_surveys = dict(self._surveys)
 
-        with self._lock:
-            old_surveys = self._surveys
-            self._surveys = new_surveys
-        for old in old_surveys.values():
-            old.close()
-        return new_surveys
+            new_surveys: dict[str, SurveyHandle] = {}
+            for sgz_path in sgz_files:
+                survey_id = sgz_path.stem
+                try:
+                    resolved_path = sgz_path.resolve()
+                    stat = resolved_path.stat()
+                    existing = existing_surveys.get(survey_id)
+                    if (
+                        existing is not None
+                        and not existing._closed
+                        and existing.sgz_path == resolved_path
+                        and existing.mtime_ns == stat.st_mtime_ns
+                        and existing.file_size == stat.st_size
+                    ):
+                        new_surveys[survey_id] = existing
+                        continue
+
+                    reader = SgzReader(str(resolved_path))
+                    if not (reader.is_4d or reader.is_3d):
+                        reader.close()
+                        log.info("Skipping 2D SGZ file %s", sgz_path)
+                        continue
+                    offsets_arr = np.asarray(reader.offsets, dtype=np.float64) if reader.is_4d else np.empty(0)
+                    default_offset_idx = _pick_default_offset_index(offsets_arr) if reader.is_4d else 0
+                    clip = _estimate_amplitude_clip(reader, default_offset_idx)
+                    shape = (
+                        [int(reader.n_ilines), int(reader.n_xlines), int(reader.n_samples), int(reader.n_offsets)]
+                        if reader.is_4d
+                        else [int(reader.n_ilines), int(reader.n_xlines), int(reader.n_samples)]
+                    )
+                    handle = SurveyHandle(
+                        survey_id=survey_id,
+                        name=survey_id,
+                        sgz_path=resolved_path,
+                        is_4d=bool(reader.is_4d),
+                        shape=shape,
+                        ilines=[int(x) for x in reader.ilines],
+                        xlines=[int(x) for x in reader.xlines],
+                        samples=[float(x) for x in reader.zslices],
+                        offsets=[float(x) for x in offsets_arr],
+                        default_offset_index=default_offset_idx,
+                        amplitude_clip_default=clip,
+                        pool_size=self.pool_size,
+                        mtime_ns=stat.st_mtime_ns,
+                        file_size=stat.st_size,
+                    )
+                    handle.seed_reader(reader)
+                    new_surveys[survey_id] = handle
+                except Exception as exc:
+                    log.exception("Failed to index SGZ file %s: %s", sgz_path, exc)
+
+            with self._lock:
+                old_surveys = self._surveys
+                self._surveys = new_surveys
+            for old_id, old in old_surveys.items():
+                if new_surveys.get(old_id) is not old:
+                    old.close()
+            return new_surveys
 
     def list_surveys(self) -> list[SurveyHandle]:
         with self._lock:

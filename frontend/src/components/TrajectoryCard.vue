@@ -6,8 +6,20 @@ const store = useWorkbenchStore()
 
 const hoveredIdx = ref<number | null>(null)
 
-const trajectory = computed(() => store.similarityResult?.trajectory ?? null)
+const trajectory = computed(
+  () => store.focusTrajectory?.trajectory ?? store.similarityResult?.trajectory ?? null,
+)
 const survey = computed(() => store.activeSurvey)
+
+const focusBadgeLabel = computed(() => {
+  const fp = store.focusPick
+  const s = survey.value
+  if (!fp || !s) return null
+  const il = s.ilines[fp.il_idx] ?? fp.il_idx
+  const xl = s.xlines[fp.xl_idx] ?? fp.xl_idx
+  const t = s.samples[fp.sample_idx] ?? fp.sample_idx
+  return `IL ${il} · XL ${xl} · ${t}ms`
+})
 
 const SVG_W = 280
 const SVG_H = 186
@@ -145,12 +157,18 @@ function jumpToOffset(offVal: number) {
 
 <template>
   <div class="rounded border border-slate-800 bg-slate-950/90 p-2.5 space-y-2">
-    <div class="flex items-center justify-between">
+    <div class="flex items-center justify-between gap-2">
       <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
         Offset Trajectory
       </span>
       <span
-        v-if="trajectory?.available"
+        v-if="focusBadgeLabel"
+        class="font-mono-num text-[9px] px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-cyan-300 truncate"
+      >
+        {{ focusBadgeLabel }}
+      </span>
+      <span
+        v-else-if="trajectory?.available"
         class="font-mono-num text-[10px] text-cyan-300"
       >
         {{ trajectory.offsets.length }} offsets
@@ -343,9 +361,9 @@ function jumpToOffset(offVal: number) {
 
     <div v-else class="text-[11px] text-slate-500 py-2">
       {{
-        store.featurePick
+        store.focusPick
           ? 'No Offset Trajectory summary available for this embedding set.'
-          : 'Pick a Feature Pick on a Section or Gather to inspect its Offset Trajectory.'
+          : 'Pick a Feature on an Inline or Crossline section to inspect its Offset Trajectory.'
       }}
     </div>
   </div>
